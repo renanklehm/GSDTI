@@ -1,0 +1,10 @@
+[project]
+name = "gsdti"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jupyter>=1.1.1",
+    "markitdown[pdf]>=0.1.6",
+]
