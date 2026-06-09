@@ -25,6 +25,7 @@
 - True KPGT generation requires an external KPGT checkout and model path passed through the CLI, since this repo does not vendor KPGT itself.
 - When the Colab runtime uses a separate KPGT environment, pass `--kpgt-python` so preprocessing and feature extraction run with that interpreter rather than with the main GS-DTI runtime.
 - `pipeline.py` now resolves KPGT helper scripts from either the repo root or `KPGT/scripts/`, so Colab setup does not need to copy `preprocess_downstream_dataset.py` or `extract_features.py` into the KPGT root.
+- `pipeline.py` also injects the KPGT repo root into `PYTHONPATH` for those subprocesses, because upstream KPGT scripts import modules as `from src...` and fail if launched without the repo root on the Python path.
 - `train_bd_intracl.py` now prepares `BindingDB` and then calls the unified trainer with `epochs=1`.
 - `train_davis_intracl.py` now expects a dataset folder named `data/DAVIS_processed/` and routes both training and evaluation through the unified trainer.
 

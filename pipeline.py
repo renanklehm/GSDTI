@@ -1,4 +1,5 @@
 import argparse
+import os
 import pickle
 import subprocess
 import sys
@@ -58,9 +59,13 @@ def _load_targets_for_graph_build(paths: DatasetPaths):
     return targets_df, protein_features
 
 
-def _run_subprocess(command: list[str], workdir: Path, description: str) -> None:
+def _run_subprocess(command: list[str], workdir: Path, description: str, extra_pythonpath: Path | None = None) -> None:
+    env = os.environ.copy()
+    if extra_pythonpath is not None:
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = str(extra_pythonpath) if not existing else os.pathsep.join([str(extra_pythonpath), existing])
     try:
-        subprocess.run(command, cwd=workdir, check=True)
+        subprocess.run(command, cwd=workdir, check=True, env=env)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"Failed to {description}. Command: {' '.join(command)}") from exc
 
@@ -124,6 +129,7 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
         [str(kpgt_python), str(preprocess_script), "--data_path", str(datasets_root), "--dataset", dataset_name],
         kpgt_dir,
         "preprocess KPGT dataset",
+        extra_pythonpath=kpgt_dir,
     )
     _run_subprocess(
         [
@@ -140,6 +146,7 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
         ],
         kpgt_dir,
         "extract KPGT features",
+        extra_pythonpath=kpgt_dir,
     )
 
     candidates = [
