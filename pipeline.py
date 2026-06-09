@@ -37,6 +37,7 @@ class PreparationConfig:
     force: bool = False
     kpgt_dir: str | None = None
     kpgt_model_path: str | None = None
+    kpgt_python: str | None = None
     esm_model_name: str = "esm2_t33_650M_UR50D"
     esmfold_chunk_size: int | None = None
 
@@ -64,6 +65,34 @@ def _run_subprocess(command: list[str], workdir: Path, description: str) -> None
         raise RuntimeError(f"Failed to {description}. Command: {' '.join(command)}") from exc
 
 
+def _resolve_kpgt_script(kpgt_dir: Path, script_name: str) -> Path:
+    candidates = [kpgt_dir / script_name, kpgt_dir / "scripts" / script_name]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Missing KPGT script {script_name} under {kpgt_dir}")
+
+
+def _patch_kpgt_compatibility(kpgt_dir: Path) -> None:
+    descriptor_path = kpgt_dir / "src" / "data" / "descriptors" / "rdNormalizedDescriptors.py"
+    if not descriptor_path.exists():
+        return
+
+    content = descriptor_path.read_text(encoding="utf-8")
+    alias_line = '    st.gilbrat = st.gibrat\n'
+    if alias_line in content:
+        return
+
+    needle = "import scipy.stats as st\n"
+    replacement = (
+        "import scipy.stats as st\n\n"
+        "if not hasattr(st, \"gilbrat\") and hasattr(st, \"gibrat\"):\n"
+        "    st.gilbrat = st.gibrat\n"
+    )
+    if needle in content:
+        descriptor_path.write_text(content.replace(needle, replacement, 1), encoding="utf-8")
+
+
 def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> None:
     if paths.drug_features.exists() and not config.force:
         return
@@ -75,9 +104,12 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
 
     kpgt_dir = Path(config.kpgt_dir).expanduser().resolve()
     model_path = Path(config.kpgt_model_path).expanduser().resolve()
-    _require_file(kpgt_dir / "preprocess_downstream_dataset.py", "KPGT preprocess_downstream_dataset.py")
-    _require_file(kpgt_dir / "extract_features.py", "KPGT extract_features.py")
+    preprocess_script = _resolve_kpgt_script(kpgt_dir, "preprocess_downstream_dataset.py")
+    extract_script = _resolve_kpgt_script(kpgt_dir, "extract_features.py")
     _require_file(model_path, "KPGT pretrained model")
+    _patch_kpgt_compatibility(kpgt_dir)
+    kpgt_python = Path(config.kpgt_python).expanduser().resolve() if config.kpgt_python else Path(sys.executable)
+    _require_file(kpgt_python, "KPGT python executable")
 
     dataset_name = paths.root.name
     datasets_root = kpgt_dir / "datasets"
@@ -89,14 +121,14 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
 
     shutil.copy2(paths.drugs_table, kpgt_dataset_dir / f"{dataset_name}.csv")
     _run_subprocess(
-        [sys.executable, "preprocess_downstream_dataset.py", "--data_path", str(datasets_root), "--dataset", dataset_name],
+        [str(kpgt_python), str(preprocess_script), "--data_path", str(datasets_root), "--dataset", dataset_name],
         kpgt_dir,
         "preprocess KPGT dataset",
     )
     _run_subprocess(
         [
-            sys.executable,
-            "extract_features.py",
+            str(kpgt_python),
+            str(extract_script),
             "--config",
             "base",
             "--model_path",
@@ -441,6 +473,7 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--artifacts-dir", help="Root directory for canonical datasets and derived artifacts")
         cmd.add_argument("--kpgt-dir", help="Path to an external KPGT checkout")
         cmd.add_argument("--kpgt-model-path", help="Path to the pretrained KPGT model file")
+        cmd.add_argument("--kpgt-python", help="Python executable to use for KPGT preprocessing and feature extraction")
         cmd.add_argument("--esm-model-name", default="esm2_t33_650M_UR50D")
         cmd.add_argument("--esmfold-chunk-size", type=int)
         cmd.add_argument("--force", action="store_true", help="Regenerate derived artifacts")
@@ -483,6 +516,7 @@ def _preparation_config_from_args(args) -> PreparationConfig:
         force=args.force,
         kpgt_dir=args.kpgt_dir,
         kpgt_model_path=args.kpgt_model_path,
+        kpgt_python=args.kpgt_python,
         esm_model_name=args.esm_model_name,
         esmfold_chunk_size=args.esmfold_chunk_size,
     )
