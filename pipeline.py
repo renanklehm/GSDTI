@@ -45,9 +45,13 @@ class PreparationConfig:
 
 def _tqdm(iterable=None, **kwargs):
     try:
-        from tqdm.auto import tqdm
+        from tqdm import tqdm
     except ModuleNotFoundError:
         return iterable
+    # Colab shell output is much more reliable when tqdm writes to stdout
+    # and when bars are not auto-disabled by the non-TTY subprocess stream.
+    kwargs.setdefault("file", sys.stdout)
+    kwargs.setdefault("disable", False)
     return tqdm(iterable, **kwargs)
 
 
@@ -200,7 +204,7 @@ def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -
 
     token_representations = []
     repr_layer = 33
-    for row in _tqdm(targets_df.itertuples(index=False), total=len(targets_df), desc="ESM-2 embeddings", unit="target", leave=False):
+    for row in _tqdm(targets_df.itertuples(index=False), total=len(targets_df), desc="ESM-2 embeddings", unit="target"):
         batch_labels, batch_strs, batch_tokens = batch_converter([(row.Target_ID, row.Target)])
         batch_tokens = batch_tokens.to(device)
         with torch.no_grad():
@@ -241,7 +245,7 @@ def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig)
         model.set_chunk_size(config.esmfold_chunk_size)
 
     paths.esmfold_dir.mkdir(parents=True, exist_ok=True)
-    for row in _tqdm(missing_targets, total=len(missing_targets), desc="ESMFold PDBs", unit="target", leave=False):
+    for row in _tqdm(missing_targets, total=len(missing_targets), desc="ESMFold PDBs", unit="target"):
         pdb_path = paths.esmfold_dir / f"{row.Target_ID}.pdb"
         with torch.no_grad():
             output = model.infer_pdb(row.Target)
@@ -268,7 +272,7 @@ def _generate_graphs(paths: DatasetPaths, config: PreparationConfig) -> None:
     print(f"Generating protein graphs for {pending_graphs} of {len(targets_df)} targets")
 
     graph_inputs = zip(targets_df.iterrows(), protein_features)
-    for (_, row), embedding in _tqdm(graph_inputs, total=len(targets_df), desc="Protein graphs", unit="target", leave=False):
+    for (_, row), embedding in _tqdm(graph_inputs, total=len(targets_df), desc="Protein graphs", unit="target"):
         graph_path = paths.graph_dir / f"{row['Target_ID']}.pt"
         if graph_path.exists() and not config.force:
             continue
