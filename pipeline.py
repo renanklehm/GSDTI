@@ -55,18 +55,21 @@ def _tqdm(iterable=None, **kwargs):
     return tqdm(iterable, **kwargs)
 
 
+def _log(message: str) -> None:
+    print(message, flush=True)
+
+
 def _iterate_with_progress(iterable, *, total: int, desc: str, unit: str):
     progress = _tqdm(iterable, total=total, desc=desc, unit=unit)
-    plain_output = not sys.stdout.isatty()
     step = max(1, total // 20) if total else 1
-    if plain_output and total:
-        print(f"{desc}: 0/{total} {unit} (0.0%)")
+    if total:
+        _log(f"{desc}: 0/{total} {unit} (0.0%)")
 
     try:
         for index, item in enumerate(progress, start=1):
             yield item
-            if plain_output and total and (index == total or index % step == 0):
-                print(f"{desc}: {index}/{total} {unit} ({(index / total) * 100:.1f}%)")
+            if total and (index == total or index % step == 0):
+                _log(f"{desc}: {index}/{total} {unit} ({(index / total) * 100:.1f}%)")
     finally:
         if progress is not None:
             progress.close()
@@ -129,10 +132,10 @@ def _patch_kpgt_compatibility(kpgt_dir: Path) -> None:
 
 def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> None:
     if paths.drug_features.exists() and not config.force:
-        print(f"Skipping KPGT features: already exists at {paths.drug_features}")
+        _log(f"Skipping KPGT features: already exists at {paths.drug_features}")
         return
 
-    print(f"Generating KPGT features into {paths.drug_features}")
+    _log(f"Generating KPGT features into {paths.drug_features}")
 
     if not config.kpgt_dir:
         raise ValueError("Missing --kpgt-dir. True KPGT feature generation requires an external KPGT checkout.")
@@ -196,14 +199,14 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
 
 def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -> None:
     if paths.protein_features.exists() and not config.force:
-        print(f"Skipping ESM-2 embeddings: already exists at {paths.protein_features}")
+        _log(f"Skipping ESM-2 embeddings: already exists at {paths.protein_features}")
         return
 
     import pandas as pd
     import torch
 
     targets_df = pd.read_csv(paths.targets_table)
-    print(f"Generating ESM-2 embeddings for {len(targets_df)} targets")
+    _log(f"Generating ESM-2 embeddings for {len(targets_df)} targets")
     try:
         esm = __import__("esm")
     except ModuleNotFoundError as exc:
@@ -250,10 +253,10 @@ def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig)
             missing_targets.append(row)
 
     if not missing_targets:
-        print(f"Skipping ESMFold structures: all {len(targets_df)} PDB files already exist in {paths.esmfold_dir}")
+        _log(f"Skipping ESMFold structures: all {len(targets_df)} PDB files already exist in {paths.esmfold_dir}")
         return
 
-    print(f"Generating ESMFold structures for {len(missing_targets)} of {len(targets_df)} targets")
+    _log(f"Generating ESMFold structures for {len(missing_targets)} of {len(targets_df)} targets")
 
     try:
         esm = __import__("esm")
@@ -292,11 +295,11 @@ def _generate_graphs(paths: DatasetPaths, config: PreparationConfig) -> None:
     if not config.force:
         existing_graphs = sum(1 for target_id in targets_df["Target_ID"] if (paths.graph_dir / f"{target_id}.pt").exists())
         if existing_graphs == len(targets_df):
-            print(f"Skipping protein graphs: all {len(targets_df)} graph files already exist in {paths.graph_dir}")
+            _log(f"Skipping protein graphs: all {len(targets_df)} graph files already exist in {paths.graph_dir}")
             return
 
     pending_graphs = len(targets_df) if config.force else len(targets_df) - existing_graphs
-    print(f"Generating protein graphs for {pending_graphs} of {len(targets_df)} targets")
+    _log(f"Generating protein graphs for {pending_graphs} of {len(targets_df)} targets")
 
     graph_inputs = zip(targets_df.iterrows(), protein_features)
     for (_, row), embedding in _iterate_with_progress(
@@ -331,20 +334,20 @@ def _generate_similarity_matrices(paths: DatasetPaths, config: PreparationConfig
     targets_df = pd.read_csv(paths.targets_table)
 
     if config.force or not paths.drug_similarity.exists():
-        print(f"Generating drug similarity matrix at {paths.drug_similarity}")
+        _log(f"Generating drug similarity matrix at {paths.drug_similarity}")
         compute_and_save_tanimoto_matrix(drugs_df, paths.drug_similarity)
     else:
-        print(f"Skipping drug similarity matrix: already exists at {paths.drug_similarity}")
+        _log(f"Skipping drug similarity matrix: already exists at {paths.drug_similarity}")
 
     if config.force or not paths.target_similarity.exists():
         missing_pdbs = [target_id for target_id in targets_df["Target_ID"] if not (paths.esmfold_dir / f"{target_id}.pdb").exists()]
         if missing_pdbs:
             missing_preview = ", ".join(map(str, missing_pdbs[:5]))
             raise FileNotFoundError(f"Missing ESMFold PDB files for TM-score matrix generation: {missing_preview}")
-        print(f"Generating target similarity matrix at {paths.target_similarity}")
+        _log(f"Generating target similarity matrix at {paths.target_similarity}")
         compute_and_save_tm_score_matrix_parallel_optimized(targets_df, paths.esmfold_dir, paths.target_similarity)
     else:
-        print(f"Skipping target similarity matrix: already exists at {paths.target_similarity}")
+        _log(f"Skipping target similarity matrix: already exists at {paths.target_similarity}")
 
 
 def prepare_dataset(
@@ -390,22 +393,19 @@ def prepare_dataset(
         ("Similarity matrices", _generate_similarity_matrices),
     ]
     progress = _tqdm(total=len(stages), desc=f"Preparing {dataset_name}", unit="stage")
-    plain_output = not sys.stdout.isatty()
     try:
-        print(f"Preparing dataset {dataset_name} under {paths.root}")
-        if plain_output:
-            print(f"Preparing {dataset_name}: 0/{len(stages)} stages (0.0%)")
+        _log(f"Preparing dataset {dataset_name} under {paths.root}")
+        _log(f"Preparing {dataset_name}: 0/{len(stages)} stages (0.0%)")
         if progress is not None:
             progress.set_postfix(stage="starting")
         for stage_index, (stage_name, stage_fn) in enumerate(stages, start=1):
-            print(f"Starting stage: {stage_name}")
+            _log(f"Starting stage: {stage_name}")
             if progress is not None:
                 progress.set_postfix(stage=stage_name)
             stage_fn(paths, config)
             if progress is not None:
                 progress.update(1)
-            if plain_output:
-                print(f"Preparing {dataset_name}: {stage_index}/{len(stages)} stages ({(stage_index / len(stages)) * 100:.1f}%)")
+            _log(f"Preparing {dataset_name}: {stage_index}/{len(stages)} stages ({(stage_index / len(stages)) * 100:.1f}%)")
     finally:
         if progress is not None:
             progress.close()
@@ -551,9 +551,9 @@ def run_training(
     )[["sequence", "smiles", "label_true", "label_predicted"]]
     output_df.to_csv(output_path, index=False)
 
-    print(f"Saved predictions to {output_path}")
-    print(f"Validation F1: {best_f1:.4f}")
-    print(f"Test F1: {test_f1:.4f}, Test Accuracy: {test_acc:.2f}")
+    _log(f"Saved predictions to {output_path}")
+    _log(f"Validation F1: {best_f1:.4f}")
+    _log(f"Test F1: {test_f1:.4f}, Test Accuracy: {test_acc:.2f}")
     return output_path
 
 
