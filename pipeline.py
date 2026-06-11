@@ -21,6 +21,16 @@ from dataset_config import (
 )
 
 
+def _configure_streams() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(line_buffering=True, write_through=True)
+
+
 @dataclass
 class TrainingConfig:
     epochs: int = 1
@@ -625,6 +635,7 @@ def _preparation_config_from_args(args) -> PreparationConfig:
 
 
 def main() -> None:
+    _configure_streams()
     parser = build_parser()
     args = parser.parse_args()
 
