@@ -492,7 +492,11 @@ def run_training(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Unified GS-DTI data preparation and training entrypoint.")
+    formatter = lambda prog: argparse.HelpFormatter(prog, width=180)
+    parser = argparse.ArgumentParser(
+        description="Unified GS-DTI data preparation and training entrypoint.",
+        formatter_class=formatter,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_shared_prepare_args(cmd):
@@ -510,10 +514,10 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--esmfold-chunk-size", type=int)
         cmd.add_argument("--force", action="store_true", help="Regenerate derived artifacts")
 
-    prepare = subparsers.add_parser("prepare", help="Prepare a built-in or custom dataset")
+    prepare = subparsers.add_parser("prepare", help="Prepare a built-in or custom dataset", formatter_class=formatter)
     add_shared_prepare_args(prepare)
 
-    train = subparsers.add_parser("train", help="Train using a prepared dataset")
+    train = subparsers.add_parser("train", help="Train using a prepared dataset", formatter_class=formatter)
     train.add_argument("--dataset", required=True, help="Training dataset name")
     train.add_argument("--test-dataset", help="Optional external evaluation dataset name")
     train.add_argument("--artifacts-dir", help="Root directory for canonical datasets and derived artifacts")
@@ -526,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--random-state", type=int, default=42)
     train.add_argument("--output-name", help="Prediction filename prefix")
 
-    run = subparsers.add_parser("run", help="Prepare then train in one command")
+    run = subparsers.add_parser("run", help="Prepare then train in one command", formatter_class=formatter)
     add_shared_prepare_args(run)
     run.add_argument("--test-dataset", help="Optional external evaluation dataset name")
     run.add_argument("--test-input", help="Optional raw test dataset in CSV or Parquet")
