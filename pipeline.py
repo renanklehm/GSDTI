@@ -43,6 +43,14 @@ class PreparationConfig:
     esmfold_chunk_size: int | None = None
 
 
+def _tqdm(iterable=None, **kwargs):
+    try:
+        from tqdm.auto import tqdm
+    except ModuleNotFoundError:
+        return iterable
+    return tqdm(iterable, **kwargs)
+
+
 def _require_file(path: Path, description: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Missing {description}: {path}")
@@ -187,7 +195,7 @@ def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -
 
     token_representations = []
     repr_layer = 33
-    for row in targets_df.itertuples(index=False):
+    for row in _tqdm(targets_df.itertuples(index=False), total=len(targets_df), desc="ESM-2 embeddings", unit="target", leave=False):
         batch_labels, batch_strs, batch_tokens = batch_converter([(row.Target_ID, row.Target)])
         batch_tokens = batch_tokens.to(device)
         with torch.no_grad():
@@ -225,7 +233,7 @@ def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig)
         model.set_chunk_size(config.esmfold_chunk_size)
 
     paths.esmfold_dir.mkdir(parents=True, exist_ok=True)
-    for row in missing_targets:
+    for row in _tqdm(missing_targets, total=len(missing_targets), desc="ESMFold PDBs", unit="target", leave=False):
         pdb_path = paths.esmfold_dir / f"{row.Target_ID}.pdb"
         with torch.no_grad():
             output = model.infer_pdb(row.Target)
@@ -242,7 +250,8 @@ def _generate_graphs(paths: DatasetPaths, config: PreparationConfig) -> None:
     targets_df, protein_features = _load_targets_for_graph_build(paths)
     paths.graph_dir.mkdir(parents=True, exist_ok=True)
 
-    for (_, row), embedding in zip(targets_df.iterrows(), protein_features):
+    graph_inputs = zip(targets_df.iterrows(), protein_features)
+    for (_, row), embedding in _tqdm(graph_inputs, total=len(targets_df), desc="Protein graphs", unit="target", leave=False):
         graph_path = paths.graph_dir / f"{row['Target_ID']}.pt"
         if graph_path.exists() and not config.force:
             continue
@@ -313,11 +322,27 @@ def prepare_dataset(
 
     pd.read_csv(paths.drugs_table)
     pd.read_csv(paths.targets_table)
-    _generate_kpgt_features(paths, config)
-    _generate_protein_features(paths, config)
-    _generate_esmfold_structures(paths, config)
-    _generate_graphs(paths, config)
-    _generate_similarity_matrices(paths, config)
+
+    stages = [
+        ("KPGT features", _generate_kpgt_features),
+        ("ESM-2 embeddings", _generate_protein_features),
+        ("ESMFold structures", _generate_esmfold_structures),
+        ("Protein graphs", _generate_graphs),
+        ("Similarity matrices", _generate_similarity_matrices),
+    ]
+    progress = _tqdm(total=len(stages), desc=f"Preparing {dataset_name}", unit="stage")
+    try:
+        if progress is not None:
+            progress.set_postfix(stage="starting")
+        for stage_name, stage_fn in stages:
+            if progress is not None:
+                progress.set_postfix(stage=stage_name)
+            stage_fn(paths, config)
+            if progress is not None:
+                progress.update(1)
+    finally:
+        if progress is not None:
+            progress.close()
     return paths
 
 
