@@ -108,7 +108,10 @@ def _patch_kpgt_compatibility(kpgt_dir: Path) -> None:
 
 def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> None:
     if paths.drug_features.exists() and not config.force:
+        print(f"Skipping KPGT features: already exists at {paths.drug_features}")
         return
+
+    print(f"Generating KPGT features into {paths.drug_features}")
 
     if not config.kpgt_dir:
         raise ValueError("Missing --kpgt-dir. True KPGT feature generation requires an external KPGT checkout.")
@@ -172,12 +175,14 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
 
 def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -> None:
     if paths.protein_features.exists() and not config.force:
+        print(f"Skipping ESM-2 embeddings: already exists at {paths.protein_features}")
         return
 
     import pandas as pd
     import torch
 
     targets_df = pd.read_csv(paths.targets_table)
+    print(f"Generating ESM-2 embeddings for {len(targets_df)} targets")
     try:
         esm = __import__("esm")
     except ModuleNotFoundError as exc:
@@ -219,7 +224,10 @@ def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig)
             missing_targets.append(row)
 
     if not missing_targets:
+        print(f"Skipping ESMFold structures: all {len(targets_df)} PDB files already exist in {paths.esmfold_dir}")
         return
+
+    print(f"Generating ESMFold structures for {len(missing_targets)} of {len(targets_df)} targets")
 
     try:
         esm = __import__("esm")
@@ -249,6 +257,15 @@ def _generate_graphs(paths: DatasetPaths, config: PreparationConfig) -> None:
 
     targets_df, protein_features = _load_targets_for_graph_build(paths)
     paths.graph_dir.mkdir(parents=True, exist_ok=True)
+    existing_graphs = 0
+    if not config.force:
+        existing_graphs = sum(1 for target_id in targets_df["Target_ID"] if (paths.graph_dir / f"{target_id}.pt").exists())
+        if existing_graphs == len(targets_df):
+            print(f"Skipping protein graphs: all {len(targets_df)} graph files already exist in {paths.graph_dir}")
+            return
+
+    pending_graphs = len(targets_df) if config.force else len(targets_df) - existing_graphs
+    print(f"Generating protein graphs for {pending_graphs} of {len(targets_df)} targets")
 
     graph_inputs = zip(targets_df.iterrows(), protein_features)
     for (_, row), embedding in _tqdm(graph_inputs, total=len(targets_df), desc="Protein graphs", unit="target", leave=False):
@@ -278,14 +295,20 @@ def _generate_similarity_matrices(paths: DatasetPaths, config: PreparationConfig
     targets_df = pd.read_csv(paths.targets_table)
 
     if config.force or not paths.drug_similarity.exists():
+        print(f"Generating drug similarity matrix at {paths.drug_similarity}")
         compute_and_save_tanimoto_matrix(drugs_df, paths.drug_similarity)
+    else:
+        print(f"Skipping drug similarity matrix: already exists at {paths.drug_similarity}")
 
     if config.force or not paths.target_similarity.exists():
         missing_pdbs = [target_id for target_id in targets_df["Target_ID"] if not (paths.esmfold_dir / f"{target_id}.pdb").exists()]
         if missing_pdbs:
             missing_preview = ", ".join(map(str, missing_pdbs[:5]))
             raise FileNotFoundError(f"Missing ESMFold PDB files for TM-score matrix generation: {missing_preview}")
+        print(f"Generating target similarity matrix at {paths.target_similarity}")
         compute_and_save_tm_score_matrix_parallel_optimized(targets_df, paths.esmfold_dir, paths.target_similarity)
+    else:
+        print(f"Skipping target similarity matrix: already exists at {paths.target_similarity}")
 
 
 def prepare_dataset(
@@ -332,9 +355,11 @@ def prepare_dataset(
     ]
     progress = _tqdm(total=len(stages), desc=f"Preparing {dataset_name}", unit="stage")
     try:
+        print(f"Preparing dataset {dataset_name} under {paths.root}")
         if progress is not None:
             progress.set_postfix(stage="starting")
         for stage_name, stage_fn in stages:
+            print(f"Starting stage: {stage_name}")
             if progress is not None:
                 progress.set_postfix(stage=stage_name)
             stage_fn(paths, config)
