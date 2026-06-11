@@ -55,6 +55,23 @@ def _tqdm(iterable=None, **kwargs):
     return tqdm(iterable, **kwargs)
 
 
+def _iterate_with_progress(iterable, *, total: int, desc: str, unit: str):
+    progress = _tqdm(iterable, total=total, desc=desc, unit=unit)
+    plain_output = not sys.stdout.isatty()
+    step = max(1, total // 20) if total else 1
+    if plain_output and total:
+        print(f"{desc}: 0/{total} {unit} (0.0%)")
+
+    try:
+        for index, item in enumerate(progress, start=1):
+            yield item
+            if plain_output and total and (index == total or index % step == 0):
+                print(f"{desc}: {index}/{total} {unit} ({(index / total) * 100:.1f}%)")
+    finally:
+        if progress is not None:
+            progress.close()
+
+
 def _require_file(path: Path, description: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"Missing {description}: {path}")
@@ -204,7 +221,12 @@ def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -
 
     token_representations = []
     repr_layer = 33
-    for row in _tqdm(targets_df.itertuples(index=False), total=len(targets_df), desc="ESM-2 embeddings", unit="target"):
+    for row in _iterate_with_progress(
+        targets_df.itertuples(index=False),
+        total=len(targets_df),
+        desc="ESM-2 embeddings",
+        unit="target",
+    ):
         batch_labels, batch_strs, batch_tokens = batch_converter([(row.Target_ID, row.Target)])
         batch_tokens = batch_tokens.to(device)
         with torch.no_grad():
@@ -245,7 +267,12 @@ def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig)
         model.set_chunk_size(config.esmfold_chunk_size)
 
     paths.esmfold_dir.mkdir(parents=True, exist_ok=True)
-    for row in _tqdm(missing_targets, total=len(missing_targets), desc="ESMFold PDBs", unit="target"):
+    for row in _iterate_with_progress(
+        missing_targets,
+        total=len(missing_targets),
+        desc="ESMFold PDBs",
+        unit="target",
+    ):
         pdb_path = paths.esmfold_dir / f"{row.Target_ID}.pdb"
         with torch.no_grad():
             output = model.infer_pdb(row.Target)
@@ -272,7 +299,12 @@ def _generate_graphs(paths: DatasetPaths, config: PreparationConfig) -> None:
     print(f"Generating protein graphs for {pending_graphs} of {len(targets_df)} targets")
 
     graph_inputs = zip(targets_df.iterrows(), protein_features)
-    for (_, row), embedding in _tqdm(graph_inputs, total=len(targets_df), desc="Protein graphs", unit="target"):
+    for (_, row), embedding in _iterate_with_progress(
+        graph_inputs,
+        total=len(targets_df),
+        desc="Protein graphs",
+        unit="target",
+    ):
         graph_path = paths.graph_dir / f"{row['Target_ID']}.pt"
         if graph_path.exists() and not config.force:
             continue
@@ -358,17 +390,22 @@ def prepare_dataset(
         ("Similarity matrices", _generate_similarity_matrices),
     ]
     progress = _tqdm(total=len(stages), desc=f"Preparing {dataset_name}", unit="stage")
+    plain_output = not sys.stdout.isatty()
     try:
         print(f"Preparing dataset {dataset_name} under {paths.root}")
+        if plain_output:
+            print(f"Preparing {dataset_name}: 0/{len(stages)} stages (0.0%)")
         if progress is not None:
             progress.set_postfix(stage="starting")
-        for stage_name, stage_fn in stages:
+        for stage_index, (stage_name, stage_fn) in enumerate(stages, start=1):
             print(f"Starting stage: {stage_name}")
             if progress is not None:
                 progress.set_postfix(stage=stage_name)
             stage_fn(paths, config)
             if progress is not None:
                 progress.update(1)
+            if plain_output:
+                print(f"Preparing {dataset_name}: {stage_index}/{len(stages)} stages ({(stage_index / len(stages)) * 100:.1f}%)")
     finally:
         if progress is not None:
             progress.close()
