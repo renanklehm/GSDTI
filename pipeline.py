@@ -433,12 +433,24 @@ def prepare_dataset(
 def _load_training_assets(paths: DatasetPaths):
     import pandas as pd
 
+    _log(f"Loading drug features: {paths.drug_features}")
     drug_features = load_feature_array(paths.drug_features)
+    _log(f"Loading drugs table: {paths.drugs_table}")
     drug_df = pd.read_csv(paths.drugs_table)
+    _log(f"Loading targets table: {paths.targets_table}")
     target_df = pd.read_csv(paths.targets_table)
     drug_dict = dict(zip(drug_df["Drug_ID"], drug_features))
+    _log(f"Loading drug similarity matrix: {paths.drug_similarity}")
     tanimoto_matrix = load_feature_array(paths.drug_similarity)
+    _log(f"Loading target similarity matrix: {paths.target_similarity}")
     tm_score_matrix = load_feature_array(paths.target_similarity)
+    _log(
+        "Loaded training assets: "
+        f"{len(drug_df)} drugs, {len(target_df)} targets, "
+        f"drug_features_shape={getattr(drug_features, 'shape', 'unknown')}, "
+        f"drug_similarity_shape={getattr(tanimoto_matrix, 'shape', 'unknown')}, "
+        f"target_similarity_shape={getattr(tm_score_matrix, 'shape', 'unknown')}"
+    )
     return drug_features, drug_df, target_df, drug_dict, tanimoto_matrix, tm_score_matrix
 
 
@@ -472,15 +484,26 @@ def run_training(
     train_paths = get_dataset_paths(train_dataset_name, artifacts_dir=artifacts_dir)
     test_paths = get_dataset_paths(test_dataset_name, artifacts_dir=artifacts_dir) if test_dataset_name else None
 
+    _log(f"Starting training for dataset '{train_dataset_name}'")
+    _log(f"Artifacts root: {resolve_artifacts_root(artifacts_dir)}")
+    _log(f"Training interaction table: {train_paths.interaction_table}")
     train_drug_feature, train_drug_df, train_target_df, train_drug_dict, tanimoto_matrix, tm_score_matrix = _load_training_assets(train_paths)
+    _log(f"Loading training interactions: {train_paths.interaction_table}")
     train_df = pd.read_csv(train_paths.interaction_table)
+    _log(f"Loaded {len(train_df)} interactions")
     stratify_labels = train_df["Label"] if train_df["Label"].nunique() > 1 else None
+    _log(
+        "Splitting train/validation: "
+        f"validation_size={config.validation_size}, random_state={config.random_state}, "
+        f"stratified={stratify_labels is not None}"
+    )
     train_df, validation_df = train_test_split(
         train_df,
         test_size=config.validation_size,
         stratify=stratify_labels,
         random_state=config.random_state,
     )
+    _log(f"Split sizes: train={len(train_df)}, validation={len(validation_df)}")
 
     if test_paths is None:
         test_df = validation_df.copy()
@@ -488,16 +511,29 @@ def run_training(
         test_target_df = train_target_df
         test_drug_dict = train_drug_dict
         test_graph_dir = train_paths.graph_dir
+        _log("No external test dataset provided; validation split will also be used for final test predictions.")
     else:
+        _log(f"Loading external test dataset '{test_dataset_name}'")
         _, test_drug_df, test_target_df, test_drug_dict, _, _ = _load_training_assets(test_paths)
+        _log(f"Loading test interactions: {test_paths.interaction_table}")
         test_df = pd.read_csv(test_paths.interaction_table)
         test_graph_dir = test_paths.graph_dir
+        _log(f"Loaded {len(test_df)} test interactions")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _log(f"Training device: {device}")
+    if device.type == "cuda":
+        _log(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+    _log("Constructing graph datasets")
     train_dataset = GraphDataset_withsim(train_df, train_drug_df, train_target_df, train_drug_dict, str(train_paths.graph_dir))
     valid_dataset = GraphDataset_withsim(validation_df, train_drug_df, train_target_df, train_drug_dict, str(train_paths.graph_dir))
     test_dataset = GraphDataset_withsim(test_df, test_drug_df, test_target_df, test_drug_dict, str(test_graph_dir))
+    _log(
+        "Dataset sizes: "
+        f"train={len(train_dataset)}, validation={len(valid_dataset)}, test={len(test_dataset)}"
+    )
 
+    _log("Building GraphDTI_bi model")
     model = GraphDTI_bi(train_drug_feature[0].shape[0], 1280, 2, surface_feature=False).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     weights = torch.tensor([1.0, 1.0], device=device)
@@ -505,6 +541,12 @@ def run_training(
     drug_contrastive_criterion = NTXentContrastiveLoss(temperature=0.07, sim_threshold=0.8)
     target_contrastive_criterion = NTXentContrastiveLoss(temperature=0.07, sim_threshold=0.5)
 
+    _log(
+        "Training config: "
+        f"epochs={config.epochs}, batch_size={config.batch_size}, "
+        f"learning_rate={config.learning_rate}, weight_decay={config.weight_decay}"
+    )
+    _log("Constructing dataloaders")
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=config.batch_size,
@@ -523,13 +565,20 @@ def run_training(
         shuffle=False,
         collate_fn=custom_collate_fn_test,
     )
+    _log(
+        "Dataloader batches: "
+        f"train={len(train_loader)}, validation={len(val_loader)}, test={len(test_loader)}"
+    )
 
     best_f1 = -1.0
     best_predictions = None
     best_labels = None
     best_probs = None
+    _log("Starting epoch loop")
+    epoch_progress = _tqdm(range(config.epochs), total=config.epochs, desc="Training epochs", unit="epoch")
     for epoch in range(config.epochs):
-        train_cl(
+        _log(f"Epoch {epoch + 1}/{config.epochs}: training")
+        train_loss, train_accuracy, train_acc_0, train_acc_1 = train_cl(
             model,
             train_loader,
             optimizer,
@@ -539,18 +588,49 @@ def run_training(
             device,
             epoch,
         )
-        _, _, _, _, val_f1, val_preds, val_labels, val_probs = evaluate_cl(model, val_loader, focal_criterion, device)
+        _log(f"Epoch {epoch + 1}/{config.epochs}: validation")
+        val_loss, val_accuracy, val_acc_0, val_acc_1, val_f1, val_preds, val_labels, val_probs = evaluate_cl(
+            model,
+            val_loader,
+            focal_criterion,
+            device,
+            desc=f"Epoch {epoch + 1} validation",
+        )
+        _log(
+            f"Epoch {epoch + 1}/{config.epochs} summary: "
+            f"train_loss={train_loss:.4f}, train_acc={train_accuracy:.2f}%, "
+            f"val_loss={val_loss:.4f}, val_acc={val_accuracy:.2f}%, val_f1={val_f1:.4f}"
+        )
         if val_f1 > best_f1:
             best_f1 = val_f1
             best_predictions = val_preds.copy()
             best_labels = val_labels.copy()
             best_probs = val_probs.copy()
+            _log(f"New best validation F1: {best_f1:.4f} at epoch {epoch + 1}")
+        set_postfix = getattr(epoch_progress, "set_postfix", None)
+        if callable(set_postfix):
+            set_postfix(best_f1=f"{best_f1:.4f}", val_f1=f"{val_f1:.4f}")
+        update = getattr(epoch_progress, "update", None)
+        if callable(update):
+            update(1)
+    close = getattr(epoch_progress, "close", None)
+    if callable(close):
+        close()
 
     if best_predictions is None or best_labels is None or best_probs is None:
         raise RuntimeError("Training did not produce validation predictions.")
 
-    _, test_acc, _, _, test_f1, test_preds, test_labels, test_probs = evaluate_cl(model, test_loader, focal_criterion, device)
+    _log("Running final test evaluation")
+    _, test_acc, _, _, test_f1, test_preds, test_labels, test_probs = evaluate_cl(
+        model,
+        test_loader,
+        focal_criterion,
+        device,
+        desc="Final test",
+    )
+    _log(f"Final test summary: accuracy={test_acc:.2f}%, f1={test_f1:.4f}")
 
+    _log("Merging validation and test predictions")
     validation_predictions = validation_df[["Drug_ID", "Target_ID", "Drug", "Target", "Y"]].copy()
     validation_predictions["predicted_label"] = best_predictions
     test_predictions = test_df[["Drug_ID", "Target_ID", "Drug", "Target", "Y"]].copy()
@@ -559,6 +639,7 @@ def run_training(
     output_root = Path(output_dir).expanduser().resolve() if output_dir else RESULTS_ROOT
     output_root.mkdir(parents=True, exist_ok=True)
     output_path = output_root / f"{output_name or train_dataset_name}_predictions.csv"
+    _log(f"Writing predictions to {output_path}")
 
     output_df = pd.concat(
         [

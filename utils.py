@@ -9,7 +9,40 @@ from Bio.PDB.PDBParser import PDBParser
 from Bio.PDB.Polypeptide import is_aa
 import os
 import pickle
+import sys
 from sklearn.metrics import matthews_corrcoef, precision_score, f1_score, recall_score
+
+
+def _tqdm(iterable=None, **kwargs):
+    try:
+        from tqdm import tqdm
+    except ModuleNotFoundError:
+        return iterable
+    kwargs.setdefault("file", sys.stdout)
+    kwargs.setdefault("disable", False)
+    return tqdm(iterable, **kwargs)
+
+
+def _log(message):
+    print(message, flush=True)
+
+
+def _iterate_loader_with_progress(loader, *, desc, unit="batch"):
+    total = len(loader)
+    progress = _tqdm(loader, total=total, desc=desc, unit=unit, leave=True)
+    step = max(1, total // 20) if total else 1
+    if total:
+        _log(f"{desc}: 0/{total} {unit} (0.0%)")
+
+    try:
+        for index, batch in enumerate(progress, start=1):
+            yield index, batch, progress
+            if total and (index == total or index % step == 0):
+                _log(f"{desc}: {index}/{total} {unit} ({(index / total) * 100:.1f}%)")
+    finally:
+        close = getattr(progress, "close", None)
+        if callable(close):
+            close()
 
 
 
@@ -236,7 +269,8 @@ def train_cl(model, train_loader, optimizer, drug_contrastive_criterion, target_
     gamma = 0.05
     
     
-    for drugs, prots, labels, drug_sim, target_sim in train_loader:
+    desc = f"Epoch {epoch + 1} train"
+    for batch_index, (drugs, prots, labels, drug_sim, target_sim), progress in _iterate_loader_with_progress(train_loader, desc=desc):
         drugs = drugs.to(device)
         prots = prots.to(device)
         labels = labels.to(device)
@@ -272,6 +306,13 @@ def train_cl(model, train_loader, optimizer, drug_contrastive_criterion, target_
         _, predicted = torch.max(outputs.data, 1)
         total += labels.size(0)
         correct += (predicted == labels).sum().item()
+        running_accuracy = 100 * correct / total if total else 0
+        set_postfix = getattr(progress, "set_postfix", None)
+        if callable(set_postfix):
+            set_postfix(
+                loss=f"{train_loss / batch_index:.4f}",
+                acc=f"{running_accuracy:.2f}%",
+            )
         
         for i in range(labels.size(0)):
             if labels[i] == 0:
@@ -287,10 +328,15 @@ def train_cl(model, train_loader, optimizer, drug_contrastive_criterion, target_
     acc_0 = correct_0 / total_0 if total_0 > 0 else 0
     acc_1 = correct_1 / total_1 if total_1 > 0 else 0
     
-    return train_loss / len(train_loader), accuracy, acc_0, acc_1
+    avg_loss = train_loss / len(train_loader)
+    _log(
+        f"Epoch {epoch + 1} train summary: loss={avg_loss:.4f}, "
+        f"accuracy={accuracy:.2f}%, class0_acc={acc_0:.4f}, class1_acc={acc_1:.4f}"
+    )
+    return avg_loss, accuracy, acc_0, acc_1
 
 
-def evaluate_cl(model, data_loader, ce_criterion, device):
+def evaluate_cl(model, data_loader, ce_criterion, device, desc="Evaluate"):
     model.eval()
     total_loss = 0
     correct = 0
@@ -310,7 +356,7 @@ def evaluate_cl(model, data_loader, ce_criterion, device):
     
     
     with torch.no_grad():
-        for batch_data in data_loader:
+        for batch_index, batch_data, progress in _iterate_loader_with_progress(data_loader, desc=desc):
             if len(batch_data) == 5:  
                 drugs, prots, labels, drug_sim, target_sim = batch_data
             else:
@@ -334,6 +380,13 @@ def evaluate_cl(model, data_loader, ce_criterion, device):
             
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+            running_accuracy = 100 * correct / total if total else 0
+            set_postfix = getattr(progress, "set_postfix", None)
+            if callable(set_postfix):
+                set_postfix(
+                    loss=f"{total_loss / batch_index:.4f}",
+                    acc=f"{running_accuracy:.2f}%",
+                )
             
             for i in range(labels.size(0)):
                 if labels[i] == 0:
@@ -357,7 +410,12 @@ def evaluate_cl(model, data_loader, ce_criterion, device):
     f1 = f1_score(all_labels, all_predictions)
 
     accuracy = 100 * correct / total
-    return total_loss / len(data_loader), accuracy, acc_0, acc_1, f1, all_predictions, all_labels, all_probs
+    avg_loss = total_loss / len(data_loader)
+    _log(
+        f"{desc} summary: loss={avg_loss:.4f}, accuracy={accuracy:.2f}%, "
+        f"class0_acc={acc_0:.4f}, class1_acc={acc_1:.4f}, f1={f1:.4f}"
+    )
+    return avg_loss, accuracy, acc_0, acc_1, f1, all_predictions, all_labels, all_probs
 
 
 

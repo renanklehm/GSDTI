@@ -51,6 +51,7 @@
 - `pipeline.py` also reconfigures `stdout` and `stderr` for line-buffered, write-through output at CLI startup so Colab subprocess runs are more likely to surface live `tqdm` redraws without requiring `python -u`.
 - `prepare` also emits periodic plain-text progress lines with `flush=True`, because Colab `!python ...` subprocess cells can both suppress `tqdm` carriage-return redraws and buffer ordinary stdout while long GPU work is running.
 - `prepare` also emits persistent `print()` logs before each stage and when stages are skipped or about to generate artifacts, because Colab subprocess output does not reliably preserve `tqdm` redraws.
+- `train` now emits persistent logs for asset loading, split sizes, device selection, dataset/dataloader sizes, epoch starts, validation/test evaluation, best-F1 updates, and output writing. Its train/validation/test batch loops also use `tqdm` bars plus periodic plain-text progress lines so long Colab runs do not look stuck.
 - `pipeline.py` applies a small compatibility patch to KPGT's `rdNormalizedDescriptors.py` before preprocessing so SciPy's modern `gibrat` name still satisfies KPGT's legacy `gilbrat` lookup.
 - Target TM-score matrix generation is exact but O(n^2) and CPU/file-I/O heavy. `prepare` / `run` expose `--target-similarity-processes` and `--target-similarity-chunksize`; on Colab, fewer workers than `cpu_count()` plus a larger chunksize can be faster than the default all-worker pool.
 - `train_bd_intracl.py` currently trains for `epochs = 1`; `train_davis_intracl.py` uses `epochs = 30`.
