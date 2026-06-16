@@ -48,7 +48,23 @@ def compute_tm_score(pair):
     return (i, j, tm_score)
 
 
-def compute_and_save_tm_score_matrix_parallel_optimized(target_df, pdb_folder, save_path, num_processes=None, batch_size=1000):
+def _iter_tm_score_pairs(pdb_files):
+    for i, pdb_file_1 in enumerate(pdb_files):
+        for j in range(i + 1, len(pdb_files)):
+            yield (pdb_file_1, pdb_files[j], i, j)
+
+
+def _resolve_tm_score_chunksize(total_tasks, num_proc, chunksize):
+    if chunksize is not None:
+        return max(1, chunksize)
+    if total_tasks == 0:
+        return 1
+    # TM-score jobs are expensive, but hundreds of thousands of tiny chunks
+    # still add scheduler overhead in Colab and similar notebook runtimes.
+    return max(16, min(256, total_tasks // max(1, num_proc * 16)))
+
+
+def compute_and_save_tm_score_matrix_parallel_optimized(target_df, pdb_folder, save_path, num_processes=None, chunksize=None):
     """
     高效并行计算并保存 TM-score 相似度矩阵，支持进度显示与分批写盘
     """
@@ -58,19 +74,18 @@ def compute_and_save_tm_score_matrix_parallel_optimized(target_df, pdb_folder, s
     pdb_files = [os.path.join(pdb_folder, f"{target_id}.pdb") for target_id in target_ids]
 
     # 只生成上三角任务，i==j直接赋1.0，不计算
-    tasks = []
-    for i in range(num_targets):
-        for j in range(i+1, num_targets):  # i < j
-            tasks.append((pdb_files[i], pdb_files[j], i, j))
+    total_tasks = num_targets * (num_targets - 1) // 2
 
     tm_score_matrix = np.zeros((num_targets, num_targets), dtype=np.float32)
     for idx in range(num_targets):
         tm_score_matrix[idx, idx] = 1.0
 
-    num_proc = num_processes or cpu_count()
-    print(f"Using {num_proc} processes, total tasks: {len(tasks)}")
+    num_proc = min(num_processes or cpu_count(), max(1, total_tasks))
+    resolved_chunksize = _resolve_tm_score_chunksize(total_tasks, num_proc, chunksize)
+    print(f"Using {num_proc} processes, chunksize {resolved_chunksize}, total tasks: {total_tasks}")
     with Pool(processes=num_proc) as pool:
-        for i, j, tm_score in tqdm(pool.imap_unordered(compute_tm_score, tasks, chunksize=4), total=len(tasks)):
+        results = pool.imap_unordered(compute_tm_score, _iter_tm_score_pairs(pdb_files), chunksize=resolved_chunksize)
+        for i, j, tm_score in tqdm(results, total=total_tasks):
             tm_score_matrix[i, j] = tm_score
             tm_score_matrix[j, i] = tm_score  # 对称
 

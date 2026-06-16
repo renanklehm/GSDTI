@@ -51,6 +51,8 @@ class PreparationConfig:
     kpgt_python: str | None = None
     esm_model_name: str = "esm2_t33_650M_UR50D"
     esmfold_chunk_size: int | None = None
+    target_similarity_processes: int | None = None
+    target_similarity_chunksize: int | None = None
 
 
 def _tqdm(iterable=None, **kwargs):
@@ -355,7 +357,13 @@ def _generate_similarity_matrices(paths: DatasetPaths, config: PreparationConfig
             missing_preview = ", ".join(map(str, missing_pdbs[:5]))
             raise FileNotFoundError(f"Missing ESMFold PDB files for TM-score matrix generation: {missing_preview}")
         _log(f"Generating target similarity matrix at {paths.target_similarity}")
-        compute_and_save_tm_score_matrix_parallel_optimized(targets_df, paths.esmfold_dir, paths.target_similarity)
+        compute_and_save_tm_score_matrix_parallel_optimized(
+            targets_df,
+            paths.esmfold_dir,
+            paths.target_similarity,
+            num_processes=config.target_similarity_processes,
+            chunksize=config.target_similarity_chunksize,
+        )
     else:
         _log(f"Skipping target similarity matrix: already exists at {paths.target_similarity}")
 
@@ -588,6 +596,8 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--kpgt-python", help="Python executable to use for KPGT preprocessing and feature extraction")
         cmd.add_argument("--esm-model-name", default="esm2_t33_650M_UR50D")
         cmd.add_argument("--esmfold-chunk-size", type=int)
+        cmd.add_argument("--target-similarity-processes", type=int, help="Worker process count for TM-score target similarity generation")
+        cmd.add_argument("--target-similarity-chunksize", type=int, help="Multiprocessing chunksize for TM-score target similarity generation")
         cmd.add_argument("--force", action="store_true", help="Regenerate derived artifacts")
 
     prepare = subparsers.add_parser("prepare", help="Prepare a built-in or custom dataset", formatter_class=formatter)
@@ -631,6 +641,8 @@ def _preparation_config_from_args(args) -> PreparationConfig:
         kpgt_python=args.kpgt_python,
         esm_model_name=args.esm_model_name,
         esmfold_chunk_size=args.esmfold_chunk_size,
+        target_similarity_processes=args.target_similarity_processes,
+        target_similarity_chunksize=args.target_similarity_chunksize,
     )
 
 
