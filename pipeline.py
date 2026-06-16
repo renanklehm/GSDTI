@@ -1,9 +1,11 @@
 import argparse
+import hashlib
+import json
 import os
 import pickle
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from dataset_config import (
@@ -39,6 +41,7 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     validation_size: float = 0.1
     random_state: int = 42
+    early_stopping_patience: int = 5
 
 
 @dataclass
@@ -69,6 +72,47 @@ def _tqdm(iterable=None, **kwargs):
 
 def _log(message: str) -> None:
     print(message, flush=True)
+
+
+def _json_default(value):
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _training_run_parameters(
+    train_dataset_name: str,
+    test_dataset_name: str | None,
+    artifacts_dir: str | None,
+    config: TrainingConfig,
+) -> dict:
+    return {
+        "train_dataset_name": train_dataset_name,
+        "test_dataset_name": test_dataset_name,
+        "artifacts_root": str(resolve_artifacts_root(artifacts_dir)),
+        "training_config": asdict(config),
+    }
+
+
+def _training_run_dir(
+    train_dataset_name: str,
+    test_dataset_name: str | None,
+    artifacts_dir: str | None,
+    config: TrainingConfig,
+) -> tuple[Path, dict]:
+    parameters = _training_run_parameters(train_dataset_name, test_dataset_name, artifacts_dir, config)
+    encoded = json.dumps(parameters, sort_keys=True, default=_json_default).encode("utf-8")
+    run_hash = hashlib.sha256(encoded).hexdigest()[:12]
+    safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in train_dataset_name)
+    run_dir = resolve_artifacts_root(artifacts_dir) / "training_runs" / f"{safe_name}_{run_hash}"
+    return run_dir, parameters
+
+
+def _load_torch_checkpoint(torch_module, path: Path, map_location):
+    try:
+        return torch_module.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch_module.load(path, map_location=map_location)
 
 
 def _iterate_with_progress(iterable, *, total: int, desc: str, unit: str):
@@ -487,6 +531,24 @@ def run_training(
     _log(f"Starting training for dataset '{train_dataset_name}'")
     _log(f"Artifacts root: {resolve_artifacts_root(artifacts_dir)}")
     _log(f"Training interaction table: {train_paths.interaction_table}")
+    if config.epochs < 1:
+        raise ValueError("--epochs must be at least 1")
+    if config.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience must be 0 or greater")
+
+    run_dir, run_parameters = _training_run_dir(train_dataset_name, test_dataset_name, artifacts_dir, config)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    params_path = run_dir / "params.json"
+    last_checkpoint_path = run_dir / "last.pt"
+    best_checkpoint_path = run_dir / "best.pt"
+    if params_path.exists():
+        saved_parameters = json.loads(params_path.read_text(encoding="utf-8"))
+        if saved_parameters != run_parameters:
+            raise RuntimeError(f"Training run parameter mismatch for {run_dir}")
+    else:
+        params_path.write_text(json.dumps(run_parameters, indent=2, sort_keys=True), encoding="utf-8")
+    _log(f"Training run directory: {run_dir}")
+
     train_drug_feature, train_drug_df, train_target_df, train_drug_dict, tanimoto_matrix, tm_score_matrix = _load_training_assets(train_paths)
     _log(f"Loading training interactions: {train_paths.interaction_table}")
     train_df = pd.read_csv(train_paths.interaction_table)
@@ -544,7 +606,8 @@ def run_training(
     _log(
         "Training config: "
         f"epochs={config.epochs}, batch_size={config.batch_size}, "
-        f"learning_rate={config.learning_rate}, weight_decay={config.weight_decay}"
+        f"learning_rate={config.learning_rate}, weight_decay={config.weight_decay}, "
+        f"early_stopping_patience={config.early_stopping_patience}"
     )
     _log("Constructing dataloaders")
     train_loader = DataLoader(
@@ -571,12 +634,47 @@ def run_training(
     )
 
     best_f1 = -1.0
-    best_predictions = None
-    best_labels = None
-    best_probs = None
-    _log("Starting epoch loop")
-    epoch_progress = _tqdm(range(config.epochs), total=config.epochs, desc="Training epochs", unit="epoch")
-    for epoch in range(config.epochs):
+    best_epoch = 0
+    bad_epochs = 0
+    start_epoch = 0
+
+    if last_checkpoint_path.exists():
+        checkpoint = _load_torch_checkpoint(torch, last_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = int(checkpoint["epoch"])
+        best_f1 = float(checkpoint.get("best_f1", -1.0))
+        best_epoch = int(checkpoint.get("best_epoch", 0))
+        bad_epochs = int(checkpoint.get("bad_epochs", 0))
+        if "torch_rng_state" in checkpoint:
+            torch.set_rng_state(checkpoint["torch_rng_state"])
+        if device.type == "cuda" and "cuda_rng_state_all" in checkpoint:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
+        if "numpy_rng_state" in checkpoint:
+            np.random.set_state(checkpoint["numpy_rng_state"])
+        _log(
+            f"Resuming matching run from epoch {start_epoch}; "
+            f"best_epoch={best_epoch}, best_f1={best_f1:.4f}, bad_epochs={bad_epochs}"
+        )
+
+    early_stop_already_reached = (
+        bool(config.early_stopping_patience)
+        and bad_epochs >= config.early_stopping_patience
+        and best_checkpoint_path.exists()
+    )
+    if start_epoch >= config.epochs:
+        _log(f"Run already reached requested epochs ({config.epochs}); skipping training loop.")
+    elif early_stop_already_reached:
+        _log(
+            f"Run already early-stopped after {start_epoch} epochs; "
+            f"best epoch was {best_epoch}."
+        )
+    else:
+        _log(f"Starting epoch loop at epoch {start_epoch + 1}")
+    epoch_range = range(start_epoch, start_epoch) if early_stop_already_reached else range(start_epoch, config.epochs)
+    remaining_epochs = len(epoch_range)
+    epoch_progress = _tqdm(epoch_range, total=remaining_epochs, desc="Training epochs", unit="epoch")
+    for epoch in epoch_range:
         _log(f"Epoch {epoch + 1}/{config.epochs}: training")
         train_loss, train_accuracy, train_acc_0, train_acc_1 = train_cl(
             model,
@@ -601,24 +699,87 @@ def run_training(
             f"train_loss={train_loss:.4f}, train_acc={train_accuracy:.2f}%, "
             f"val_loss={val_loss:.4f}, val_acc={val_accuracy:.2f}%, val_f1={val_f1:.4f}"
         )
+        checkpoint_payload = {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_f1": best_f1,
+            "best_epoch": best_epoch,
+            "bad_epochs": bad_epochs,
+            "training_parameters": run_parameters,
+            "torch_rng_state": torch.get_rng_state(),
+            "numpy_rng_state": np.random.get_state(),
+            "metrics": {
+                "train_loss": train_loss,
+                "train_accuracy": train_accuracy,
+                "train_acc_0": train_acc_0,
+                "train_acc_1": train_acc_1,
+                "val_loss": val_loss,
+                "val_accuracy": val_accuracy,
+                "val_acc_0": val_acc_0,
+                "val_acc_1": val_acc_1,
+                "val_f1": val_f1,
+            },
+        }
+        if device.type == "cuda":
+            checkpoint_payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
         if val_f1 > best_f1:
             best_f1 = val_f1
-            best_predictions = val_preds.copy()
-            best_labels = val_labels.copy()
-            best_probs = val_probs.copy()
+            best_epoch = epoch + 1
+            bad_epochs = 0
+            checkpoint_payload["best_f1"] = best_f1
+            checkpoint_payload["best_epoch"] = best_epoch
+            checkpoint_payload["bad_epochs"] = bad_epochs
+            torch.save(checkpoint_payload, best_checkpoint_path)
             _log(f"New best validation F1: {best_f1:.4f} at epoch {epoch + 1}")
+        else:
+            bad_epochs += 1
+            checkpoint_payload["bad_epochs"] = bad_epochs
+            if config.early_stopping_patience:
+                _log(
+                    f"Validation F1 did not improve; plateau count "
+                    f"{bad_epochs}/{config.early_stopping_patience}"
+                )
+            else:
+                _log("Validation F1 did not improve; early stopping is disabled")
+        checkpoint_payload["best_f1"] = best_f1
+        checkpoint_payload["best_epoch"] = best_epoch
+        torch.save(checkpoint_payload, last_checkpoint_path)
+        _log(f"Saved checkpoints: last={last_checkpoint_path}, best={best_checkpoint_path}")
         set_postfix = getattr(epoch_progress, "set_postfix", None)
         if callable(set_postfix):
             set_postfix(best_f1=f"{best_f1:.4f}", val_f1=f"{val_f1:.4f}")
         update = getattr(epoch_progress, "update", None)
         if callable(update):
             update(1)
+        if config.early_stopping_patience and bad_epochs >= config.early_stopping_patience:
+            _log(
+                f"Early stopping at epoch {epoch + 1}: validation F1 plateaued "
+                f"for {bad_epochs} epochs; best epoch was {best_epoch}."
+            )
+            break
     close = getattr(epoch_progress, "close", None)
     if callable(close):
         close()
 
-    if best_predictions is None or best_labels is None or best_probs is None:
-        raise RuntimeError("Training did not produce validation predictions.")
+    if not best_checkpoint_path.exists():
+        raise RuntimeError("Training did not produce a best checkpoint.")
+
+    _log(f"Loading best checkpoint for evaluation: {best_checkpoint_path}")
+    best_checkpoint = _load_torch_checkpoint(torch, best_checkpoint_path, map_location=device)
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    best_f1 = float(best_checkpoint.get("best_f1", best_f1))
+    best_epoch = int(best_checkpoint.get("best_epoch", best_epoch))
+    _log(f"Best validation checkpoint: epoch={best_epoch}, f1={best_f1:.4f}")
+
+    _log("Recomputing validation predictions from best checkpoint")
+    _, _, _, _, best_f1, best_predictions, best_labels, best_probs = evaluate_cl(
+        model,
+        val_loader,
+        focal_criterion,
+        device,
+        desc="Best checkpoint validation",
+    )
 
     _log("Running final test evaluation")
     _, test_acc, _, _, test_f1, test_preds, test_labels, test_probs = evaluate_cl(
@@ -695,6 +856,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--weight-decay", type=float, default=1e-4)
     train.add_argument("--validation-size", type=float, default=0.1)
     train.add_argument("--random-state", type=int, default=42)
+    train.add_argument("--early-stopping-patience", type=int, default=5, help="Stop after this many validation-F1 plateau epochs; 0 disables early stopping")
     train.add_argument("--output-name", help="Prediction filename prefix")
 
     run = subparsers.add_parser("run", help="Prepare then train in one command", formatter_class=formatter)
@@ -708,6 +870,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--weight-decay", type=float, default=1e-4)
     run.add_argument("--validation-size", type=float, default=0.1)
     run.add_argument("--random-state", type=int, default=42)
+    run.add_argument("--early-stopping-patience", type=int, default=5, help="Stop after this many validation-F1 plateau epochs; 0 disables early stopping")
     run.add_argument("--output-name", help="Prediction filename prefix")
     return parser
 
@@ -751,6 +914,7 @@ def main() -> None:
             weight_decay=args.weight_decay,
             validation_size=args.validation_size,
             random_state=args.random_state,
+            early_stopping_patience=args.early_stopping_patience,
         )
         run_training(
             args.dataset,
@@ -791,6 +955,7 @@ def main() -> None:
             weight_decay=args.weight_decay,
             validation_size=args.validation_size,
             random_state=args.random_state,
+            early_stopping_patience=args.early_stopping_patience,
         )
         run_training(
             args.dataset,
