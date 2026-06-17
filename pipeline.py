@@ -52,6 +52,9 @@ class PreparationConfig:
     kpgt_dir: str | None = None
     kpgt_model_path: str | None = None
     kpgt_python: str | None = None
+    kpgt_preprocess_jobs: int = 4
+    kpgt_chunk_size: int = 1024
+    kpgt_batch_size: int = 32
     esm_model_name: str = "esm2_t33_650M_UR50D"
     esmfold_chunk_size: int | None = None
     target_similarity_processes: int | None = None
@@ -63,8 +66,8 @@ def _tqdm(iterable=None, **kwargs):
         from tqdm import tqdm
     except ModuleNotFoundError:
         return iterable
-    # Colab shell output is much more reliable when tqdm writes to stdout
-    # and when bars are not auto-disabled by the non-TTY subprocess stream.
+    # SSH and notebook subprocess output are more reliable when tqdm writes to
+    # stdout and when bars are not auto-disabled by non-TTY streams.
     kwargs.setdefault("file", sys.stdout)
     kwargs.setdefault("disable", False)
     return tqdm(iterable, **kwargs)
@@ -200,57 +203,37 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
 
     kpgt_dir = Path(config.kpgt_dir).expanduser().resolve()
     model_path = Path(config.kpgt_model_path).expanduser().resolve()
-    preprocess_script = _resolve_kpgt_script(kpgt_dir, "preprocess_downstream_dataset.py")
-    extract_script = _resolve_kpgt_script(kpgt_dir, "extract_features.py")
+    streaming_script = Path(__file__).resolve().parent / "scripts" / "kpgt_streaming_extract.py"
+    _require_file(streaming_script, "streaming KPGT extraction script")
     _require_file(model_path, "KPGT pretrained model")
     _patch_kpgt_compatibility(kpgt_dir)
     kpgt_python = Path(config.kpgt_python).expanduser().resolve() if config.kpgt_python else Path(sys.executable)
     _require_file(kpgt_python, "KPGT python executable")
 
-    dataset_name = paths.root.name
-    datasets_root = kpgt_dir / "datasets"
-    datasets_root.mkdir(parents=True, exist_ok=True)
-    kpgt_dataset_dir = datasets_root / dataset_name
-    kpgt_dataset_dir.mkdir(parents=True, exist_ok=True)
-
-    import shutil
-
-    shutil.copy2(paths.drugs_table, kpgt_dataset_dir / f"{dataset_name}.csv")
-    _run_subprocess(
-        [str(kpgt_python), str(preprocess_script), "--data_path", str(datasets_root), "--dataset", dataset_name],
-        kpgt_dir,
-        "preprocess KPGT dataset",
-        extra_pythonpath=kpgt_dir,
-    )
     _run_subprocess(
         [
             str(kpgt_python),
-            str(extract_script),
+            str(streaming_script),
+            "--input-csv",
+            str(paths.drugs_table),
+            "--output-npz",
+            str(paths.drug_features),
             "--config",
             "base",
-            "--model_path",
+            "--model-path",
             str(model_path),
-            "--data_path",
-            str(datasets_root),
-            "--dataset",
-            dataset_name,
+            "--chunk-size",
+            str(config.kpgt_chunk_size),
+            "--batch-size",
+            str(config.kpgt_batch_size),
+            "--n-jobs",
+            str(config.kpgt_preprocess_jobs),
         ],
         kpgt_dir,
-        "extract KPGT features",
+        "stream KPGT features",
         extra_pythonpath=kpgt_dir,
     )
-
-    candidates = [
-        kpgt_dataset_dir / "kpgt_base.npz",
-        kpgt_dir / "datasets" / "bind_drugs" / "kpgt_base.npz",
-        kpgt_dir / "datasets" / dataset_name / "kpgt_base.npz",
-    ]
-    generated = next((candidate for candidate in candidates if candidate.exists()), None)
-    if generated is None:
-        raise FileNotFoundError("KPGT finished without producing kpgt_base.npz in an expected location.")
-
-    paths.drug_features.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(generated, paths.drug_features)
+    _require_file(paths.drug_features, "KPGT drug feature output")
 
 
 def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -> None:
@@ -836,6 +819,9 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--kpgt-dir", help="Path to an external KPGT checkout")
         cmd.add_argument("--kpgt-model-path", help="Path to the pretrained KPGT model file")
         cmd.add_argument("--kpgt-python", help="Python executable to use for KPGT preprocessing and feature extraction")
+        cmd.add_argument("--kpgt-preprocess-jobs", type=int, default=4, help="Worker count used inside each streaming KPGT chunk")
+        cmd.add_argument("--kpgt-chunk-size", type=int, default=1024, help="Number of drugs held in memory during streaming KPGT feature extraction")
+        cmd.add_argument("--kpgt-batch-size", type=int, default=32, help="KPGT model inference batch size")
         cmd.add_argument("--esm-model-name", default="esm2_t33_650M_UR50D")
         cmd.add_argument("--esmfold-chunk-size", type=int)
         cmd.add_argument("--target-similarity-processes", type=int, help="Worker process count for TM-score target similarity generation")
@@ -883,6 +869,9 @@ def _preparation_config_from_args(args) -> PreparationConfig:
         kpgt_dir=args.kpgt_dir,
         kpgt_model_path=args.kpgt_model_path,
         kpgt_python=args.kpgt_python,
+        kpgt_preprocess_jobs=args.kpgt_preprocess_jobs,
+        kpgt_chunk_size=args.kpgt_chunk_size,
+        kpgt_batch_size=args.kpgt_batch_size,
         esm_model_name=args.esm_model_name,
         esmfold_chunk_size=args.esmfold_chunk_size,
         target_similarity_processes=args.target_similarity_processes,
