@@ -218,6 +218,8 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
             str(paths.drugs_table),
             "--output-npz",
             str(paths.drug_features),
+            "--excluded-csv",
+            str(paths.excluded_table),
             "--config",
             "base",
             "--model-path",
@@ -234,6 +236,62 @@ def _generate_kpgt_features(paths: DatasetPaths, config: PreparationConfig) -> N
         extra_pythonpath=kpgt_dir,
     )
     _require_file(paths.drug_features, "KPGT drug feature output")
+
+
+def _remove_if_exists(path: Path) -> None:
+    if path.exists():
+        path.unlink()
+
+
+def _apply_kpgt_exclusions(paths: DatasetPaths) -> None:
+    if not paths.excluded_table.exists():
+        return
+
+    import pandas as pd
+
+    excluded = pd.read_csv(paths.excluded_table)
+    if excluded.empty:
+        _log(f"No KPGT exclusions recorded at {paths.excluded_table}")
+        return
+    if "Drug_ID" not in excluded.columns:
+        raise ValueError(f"KPGT exclusion table is missing Drug_ID: {paths.excluded_table}")
+
+    excluded_drug_ids = set(excluded["Drug_ID"].dropna().astype(str))
+    if not excluded_drug_ids:
+        _log(f"No KPGT exclusions with Drug_ID recorded at {paths.excluded_table}")
+        return
+
+    interactions = pd.read_csv(paths.interaction_table)
+    drugs = pd.read_csv(paths.drugs_table)
+    before_interactions = len(interactions)
+    before_drugs = len(drugs)
+    matched_drugs = drugs["Drug_ID"].astype(str).isin(excluded_drug_ids)
+    matched_interactions = interactions["Drug_ID"].astype(str).isin(excluded_drug_ids)
+    if not matched_drugs.any() and not matched_interactions.any():
+        _log(f"KPGT exclusions already applied from {paths.excluded_table}")
+        return
+
+    interactions = interactions[~matched_interactions].reset_index(drop=True)
+    drugs = drugs[~matched_drugs].reset_index(drop=True)
+    if interactions.empty:
+        raise ValueError(f"KPGT exclusions removed every interaction in {paths.interaction_table}")
+    if drugs.empty:
+        raise ValueError(f"KPGT exclusions removed every drug in {paths.drugs_table}")
+
+    write_table(interactions, paths.interaction_table)
+    write_table(drugs, paths.drugs_table)
+    write_table(build_targets_table(interactions), paths.targets_table)
+
+    for stale_path in [paths.protein_features, paths.drug_similarity, paths.target_similarity]:
+        _remove_if_exists(stale_path)
+
+    _log(
+        "Applied KPGT exclusions: "
+        f"excluded_drugs={len(excluded_drug_ids)}, "
+        f"drugs={before_drugs}->{len(drugs)}, "
+        f"interactions={before_interactions}->{len(interactions)}, "
+        f"details={paths.excluded_table}"
+    )
 
 
 def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -> None:
@@ -448,6 +506,8 @@ def prepare_dataset(
             if progress is not None:
                 progress.set_postfix(stage=stage_name)
             stage_fn(paths, config)
+            if stage_name == "KPGT features":
+                _apply_kpgt_exclusions(paths)
             if progress is not None:
                 progress.update(1)
             _log(f"Preparing {dataset_name}: {stage_index}/{len(stages)} stages ({(stage_index / len(stages)) * 100:.1f}%)")

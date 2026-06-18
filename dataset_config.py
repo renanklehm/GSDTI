@@ -15,6 +15,7 @@ class DatasetPaths:
     name: str
     root: Path
     interaction_table: Path
+    excluded_table: Path
     drugs_table: Path
     targets_table: Path
     drug_features: Path
@@ -53,6 +54,7 @@ def get_dataset_paths(dataset_name: str, artifacts_dir: str | Path | None = None
         name=dataset_name,
         root=root,
         interaction_table=root / "df_less1000.csv",
+        excluded_table=root / "excluded.csv",
         drugs_table=drugs_dir / "drugs.csv",
         targets_table=targets_dir / "targets.csv",
         drug_features=drugs_dir / "kpgt_base.npz",
