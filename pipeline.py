@@ -339,6 +339,8 @@ def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -
 
 
 def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig) -> None:
+    import gc
+
     import pandas as pd
     import torch
 
@@ -348,12 +350,19 @@ def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig)
         pdb_path = paths.esmfold_dir / f"{row.Target_ID}.pdb"
         if config.force or not pdb_path.exists():
             missing_targets.append(row)
+    missing_targets.sort(key=lambda row: (len(str(row.Target)), str(row.Target_ID)))
 
     if not missing_targets:
         _log(f"Skipping ESMFold structures: all {len(targets_df)} PDB files already exist in {paths.esmfold_dir}")
         return
 
-    _log(f"Generating ESMFold structures for {len(missing_targets)} of {len(targets_df)} targets")
+    shortest_target = len(str(missing_targets[0].Target))
+    longest_target = len(str(missing_targets[-1].Target))
+    _log(
+        "Generating ESMFold structures for "
+        f"{len(missing_targets)} of {len(targets_df)} targets, sorted by length "
+        f"({shortest_target} to {longest_target} residues)"
+    )
 
     try:
         esm = __import__("esm")
@@ -363,6 +372,7 @@ def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = esm.pretrained.esmfold_v1()
     model = model.eval().to(device)
+    current_chunk_size = config.esmfold_chunk_size
     if config.esmfold_chunk_size is not None:
         model.set_chunk_size(config.esmfold_chunk_size)
 
@@ -374,10 +384,43 @@ def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig)
         unit="target",
     ):
         pdb_path = paths.esmfold_dir / f"{row.Target_ID}.pdb"
-        with torch.no_grad():
-            output = model.infer_pdb(row.Target)
+        target_length = len(str(row.Target))
+        output = None
+        while output is None:
+            chunk_size_label = current_chunk_size if current_chunk_size is not None else "default"
+            _log(f"ESMFold target {row.Target_ID}: generating PDB for {target_length} residues with chunk_size={chunk_size_label}")
+            try:
+                with torch.no_grad():
+                    output = model.infer_pdb(row.Target)
+            except torch.OutOfMemoryError as exc:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+
+                if current_chunk_size == 1:
+                    raise RuntimeError(
+                        "ESMFold ran out of CUDA memory while generating "
+                        f"Target_ID={row.Target_ID} ({target_length} residues, chunk_size=1). "
+                        "Rerun prepare without --force so completed PDBs are skipped; this target likely needs "
+                        "CPU ESMFold, a larger-memory GPU, or removal from the dataset."
+                    ) from exc
+
+                next_chunk_size = 128 if current_chunk_size is None else max(1, current_chunk_size // 2)
+                _log(
+                    "ESMFold CUDA OOM for "
+                    f"Target_ID={row.Target_ID} ({target_length} residues) at chunk_size={chunk_size_label}; "
+                    f"retrying with chunk_size={next_chunk_size}"
+                )
+                current_chunk_size = next_chunk_size
+                model.set_chunk_size(current_chunk_size)
+
         with open(pdb_path, "w", encoding="utf-8") as handle:
             handle.write(output)
+        output = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def _generate_graphs(paths: DatasetPaths, config: PreparationConfig) -> None:
