@@ -263,6 +263,7 @@ def _apply_kpgt_exclusions(paths: DatasetPaths) -> None:
 
     interactions = pd.read_csv(paths.interaction_table)
     drugs = pd.read_csv(paths.drugs_table)
+    old_targets = pd.read_csv(paths.targets_table)
     before_interactions = len(interactions)
     before_drugs = len(drugs)
     matched_drugs = drugs["Drug_ID"].astype(str).isin(excluded_drug_ids)
@@ -273,6 +274,7 @@ def _apply_kpgt_exclusions(paths: DatasetPaths) -> None:
 
     interactions = interactions[~matched_interactions].reset_index(drop=True)
     drugs = drugs[~matched_drugs].reset_index(drop=True)
+    new_targets = build_targets_table(interactions)
     if interactions.empty:
         raise ValueError(f"KPGT exclusions removed every interaction in {paths.interaction_table}")
     if drugs.empty:
@@ -280,10 +282,15 @@ def _apply_kpgt_exclusions(paths: DatasetPaths) -> None:
 
     write_table(interactions, paths.interaction_table)
     write_table(drugs, paths.drugs_table)
-    write_table(build_targets_table(interactions), paths.targets_table)
+    write_table(new_targets, paths.targets_table)
 
-    for stale_path in [paths.protein_features, paths.drug_similarity, paths.target_similarity]:
-        _remove_if_exists(stale_path)
+    target_table_changed = not old_targets.reset_index(drop=True).equals(new_targets.reset_index(drop=True))
+    _remove_if_exists(paths.drug_similarity)
+    if target_table_changed:
+        for stale_path in [paths.protein_features, paths.target_similarity]:
+            _remove_if_exists(stale_path)
+    else:
+        _log("KPGT exclusions changed drugs/interactions but targets are unchanged; preserving target-derived artifacts")
 
     _log(
         "Applied KPGT exclusions: "
