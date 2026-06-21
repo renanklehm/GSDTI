@@ -57,6 +57,7 @@ class PreparationConfig:
     kpgt_batch_size: int = 32
     esm_model_name: str = "esm2_t33_650M_UR50D"
     esmfold_chunk_size: int | None = None
+    skip_esmfold: bool = False
     target_similarity_processes: int | None = None
     target_similarity_chunksize: int | None = None
 
@@ -243,6 +244,83 @@ def _remove_if_exists(path: Path) -> None:
         path.unlink()
 
 
+def _restrict_to_existing_esmfold_targets(paths: DatasetPaths, config: PreparationConfig) -> None:
+    if not config.skip_esmfold:
+        return
+
+    import numpy as np
+    import pandas as pd
+
+    interactions = pd.read_csv(paths.interaction_table)
+    old_drugs = pd.read_csv(paths.drugs_table)
+    old_targets = pd.read_csv(paths.targets_table)
+    before_interactions = len(interactions)
+    available_target_ids = {
+        pdb_path.stem
+        for pdb_path in paths.esmfold_dir.glob("*.pdb")
+        if pdb_path.is_file()
+    }
+    retained_target_mask = old_targets["Target_ID"].astype(str).isin(available_target_ids)
+    if not retained_target_mask.any():
+        raise ValueError(
+            f"--skip-esmfold found no calculated target PDBs from {paths.targets_table} in {paths.esmfold_dir}"
+        )
+
+    retained_target_ids = set(old_targets.loc[retained_target_mask, "Target_ID"].astype(str))
+    interactions = interactions[interactions["Target_ID"].astype(str).isin(retained_target_ids)].reset_index(drop=True)
+    new_targets = build_targets_table(interactions)
+    new_drugs = build_drugs_table(interactions)
+    if interactions.empty:
+        raise ValueError("--skip-esmfold removed every interaction from the dataset")
+
+    if len(new_targets) == len(old_targets) and len(new_drugs) == len(old_drugs):
+        _log(f"Skipping ESMFold generation: all {len(new_targets)} canonical targets already have PDB files")
+        return
+
+    old_target_positions = {str(target_id): index for index, target_id in enumerate(old_targets["Target_ID"])}
+    old_drug_positions = {str(drug_id): index for index, drug_id in enumerate(old_drugs["Drug_ID"])}
+    target_indices = [old_target_positions[str(target_id)] for target_id in new_targets["Target_ID"]]
+    drug_indices = [old_drug_positions[str(drug_id)] for drug_id in new_drugs["Drug_ID"]]
+
+    if not config.force and paths.protein_features.exists():
+        with open(paths.protein_features, "rb") as handle:
+            protein_features = pickle.load(handle)
+        if len(protein_features) == len(old_targets):
+            with open(paths.protein_features, "wb") as handle:
+                pickle.dump([protein_features[index] for index in target_indices], handle)
+        elif len(protein_features) != len(new_targets):
+            raise ValueError("prot_rep.pkl is aligned with neither the original nor filtered targets.csv")
+
+    if paths.drug_features.exists():
+        drug_features = load_feature_array(paths.drug_features)
+        if len(drug_features) == len(old_drugs):
+            np.savez(paths.drug_features, fps=drug_features[drug_indices])
+        elif len(drug_features) != len(new_drugs):
+            raise ValueError("kpgt_base.npz is aligned with neither the original nor filtered drugs.csv")
+
+    for matrix_path, old_size, new_size, indices in [
+        (paths.target_similarity, len(old_targets), len(new_targets), target_indices),
+        (paths.drug_similarity, len(old_drugs), len(new_drugs), drug_indices),
+    ]:
+        if config.force or not matrix_path.exists():
+            continue
+        matrix = load_feature_array(matrix_path)
+        if matrix.shape == (old_size, old_size):
+            np.savez(matrix_path, matrix[np.ix_(indices, indices)])
+        elif matrix.shape != (new_size, new_size):
+            raise ValueError(f"{matrix_path.name} is aligned with neither the original nor filtered canonical table")
+
+    write_table(interactions, paths.interaction_table)
+    write_table(new_drugs, paths.drugs_table)
+    write_table(new_targets, paths.targets_table)
+    _log(
+        "Skipping ESMFold generation and restricting the dataset to existing PDBs: "
+        f"targets={len(old_targets)}->{len(new_targets)}, "
+        f"drugs={len(old_drugs)}->{len(new_drugs)}, "
+        f"interactions={before_interactions}->{len(interactions)}"
+    )
+
+
 def _apply_kpgt_exclusions(paths: DatasetPaths) -> None:
     if not paths.excluded_table.exists():
         return
@@ -346,6 +424,10 @@ def _generate_protein_features(paths: DatasetPaths, config: PreparationConfig) -
 
 
 def _generate_esmfold_structures(paths: DatasetPaths, config: PreparationConfig) -> None:
+    if config.skip_esmfold:
+        _log("Skipping ESMFold structure generation because --skip-esmfold was passed")
+        return
+
     import gc
 
     import pandas as pd
@@ -537,7 +619,6 @@ def prepare_dataset(
 
     pd.read_csv(paths.drugs_table)
     pd.read_csv(paths.targets_table)
-
     stages = [
         ("KPGT features", _generate_kpgt_features),
         ("ESM-2 embeddings", _generate_protein_features),
@@ -558,6 +639,7 @@ def prepare_dataset(
             stage_fn(paths, config)
             if stage_name == "KPGT features":
                 _apply_kpgt_exclusions(paths)
+                _restrict_to_existing_esmfold_targets(paths, config)
             if progress is not None:
                 progress.update(1)
             _log(f"Preparing {dataset_name}: {stage_index}/{len(stages)} stages ({(stage_index / len(stages)) * 100:.1f}%)")
@@ -934,6 +1016,11 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--kpgt-batch-size", type=int, default=32, help="KPGT model inference batch size")
         cmd.add_argument("--esm-model-name", default="esm2_t33_650M_UR50D")
         cmd.add_argument("--esmfold-chunk-size", type=int)
+        cmd.add_argument(
+            "--skip-esmfold",
+            action="store_true",
+            help="Skip ESMFold generation and keep only targets with existing targets/esmfold/<Target_ID>.pdb files",
+        )
         cmd.add_argument("--target-similarity-processes", type=int, help="Worker process count for TM-score target similarity generation")
         cmd.add_argument("--target-similarity-chunksize", type=int, help="Multiprocessing chunksize for TM-score target similarity generation")
         cmd.add_argument("--force", action="store_true", help="Regenerate derived artifacts")
@@ -984,6 +1071,7 @@ def _preparation_config_from_args(args) -> PreparationConfig:
         kpgt_batch_size=args.kpgt_batch_size,
         esm_model_name=args.esm_model_name,
         esmfold_chunk_size=args.esmfold_chunk_size,
+        skip_esmfold=args.skip_esmfold,
         target_similarity_processes=args.target_similarity_processes,
         target_similarity_chunksize=args.target_similarity_chunksize,
     )
