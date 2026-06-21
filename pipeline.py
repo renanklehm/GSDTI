@@ -244,6 +244,46 @@ def _remove_if_exists(path: Path) -> None:
         path.unlink()
 
 
+def _load_pdb_sequence(pdb_path: Path) -> str:
+    from Bio.PDB import PDBParser
+
+    amino_acid_map = {
+        "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F",
+        "GLY": "G", "HIS": "H", "ILE": "I", "LYS": "K", "LEU": "L",
+        "MET": "M", "ASN": "N", "PRO": "P", "GLN": "Q", "ARG": "R",
+        "SER": "S", "THR": "T", "VAL": "V", "TRP": "W", "TYR": "Y", "SEC": "U",
+    }
+    structure = PDBParser(QUIET=True).get_structure("protein", str(pdb_path))
+    residues = []
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                if residue.id[0] == " " and "CA" in residue:
+                    residues.append(amino_acid_map.get(residue.resname, "X"))
+    return "".join(residues)
+
+
+def _record_target_exclusions(paths: DatasetPaths, excluded_rows: list[dict]) -> None:
+    if not excluded_rows:
+        return
+
+    import pandas as pd
+
+    new_exclusions = pd.DataFrame(excluded_rows)
+    if paths.excluded_table.exists():
+        exclusions = pd.read_csv(paths.excluded_table)
+        exclusions = pd.concat([exclusions, new_exclusions], ignore_index=True, sort=False)
+    else:
+        exclusions = new_exclusions
+    identifying_columns = [
+        column
+        for column in ["entity_type", "Drug_ID", "Target_ID", "exclusion_reason"]
+        if column in exclusions.columns
+    ]
+    exclusions = exclusions.drop_duplicates(subset=identifying_columns, keep="last")
+    write_table(exclusions, paths.excluded_table)
+
+
 def _restrict_to_existing_esmfold_targets(paths: DatasetPaths, config: PreparationConfig) -> None:
     if not config.skip_esmfold:
         return
@@ -255,18 +295,62 @@ def _restrict_to_existing_esmfold_targets(paths: DatasetPaths, config: Preparati
     old_drugs = pd.read_csv(paths.drugs_table)
     old_targets = pd.read_csv(paths.targets_table)
     before_interactions = len(interactions)
-    available_target_ids = {
-        pdb_path.stem
-        for pdb_path in paths.esmfold_dir.glob("*.pdb")
-        if pdb_path.is_file()
-    }
-    retained_target_mask = old_targets["Target_ID"].astype(str).isin(available_target_ids)
-    if not retained_target_mask.any():
-        raise ValueError(
-            f"--skip-esmfold found no calculated target PDBs from {paths.targets_table} in {paths.esmfold_dir}"
+    retained_target_ids = set()
+    excluded_rows = []
+    exclusion_counts = {"missing": 0, "unreadable": 0, "mismatched": 0}
+    for source_row, row in old_targets.iterrows():
+        target_id = str(row["Target_ID"])
+        canonical_sequence = str(row["Target"]).upper()
+        pdb_path = paths.esmfold_dir / f"{target_id}.pdb"
+        if not pdb_path.exists():
+            reason = "Missing ESMFold PDB"
+            exclusion_kind = "missing"
+        else:
+            try:
+                pdb_sequence = _load_pdb_sequence(pdb_path)
+            except Exception as exc:
+                reason = f"Unreadable ESMFold PDB: {type(exc).__name__}: {exc}"
+                exclusion_kind = "unreadable"
+            else:
+                if pdb_sequence == canonical_sequence:
+                    retained_target_ids.add(target_id)
+                    continue
+                reason = (
+                    "ESMFold sequence mismatch: "
+                    f"canonical_residues={len(canonical_sequence)}, pdb_residues={len(pdb_sequence)}"
+                )
+                exclusion_kind = "mismatched"
+
+        exclusion_counts[exclusion_kind] += 1
+        if exclusion_kind != "missing":
+            _log(f"Excluding target {target_id}: {reason}")
+        excluded_rows.append(
+            {
+                "source_row": int(source_row),
+                "entity_type": "target",
+                "Drug_ID": None,
+                "smiles": None,
+                "Target_ID": target_id,
+                "Target": row["Target"],
+                "exclusion_reason": reason,
+            }
         )
 
-    retained_target_ids = set(old_targets.loc[retained_target_mask, "Target_ID"].astype(str))
+    _record_target_exclusions(paths, excluded_rows)
+    if excluded_rows:
+        _log(
+            "Excluded targets while reusing ESMFold PDBs: "
+            f"missing={exclusion_counts['missing']}, "
+            f"unreadable={exclusion_counts['unreadable']}, "
+            f"sequence_mismatch={exclusion_counts['mismatched']}; "
+            f"details={paths.excluded_table}"
+        )
+    retained_target_mask = old_targets["Target_ID"].astype(str).isin(retained_target_ids)
+    if not retained_target_mask.any():
+        raise ValueError(
+            f"--skip-esmfold found no matching calculated target PDBs from {paths.targets_table} in {paths.esmfold_dir}"
+        )
+
     interactions = interactions[interactions["Target_ID"].astype(str).isin(retained_target_ids)].reset_index(drop=True)
     new_targets = build_targets_table(interactions)
     new_drugs = build_drugs_table(interactions)
@@ -1019,7 +1103,7 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument(
             "--skip-esmfold",
             action="store_true",
-            help="Skip ESMFold generation and keep only targets with existing targets/esmfold/<Target_ID>.pdb files",
+            help="Skip ESMFold generation and keep only targets with existing, sequence-matching targets/esmfold/<Target_ID>.pdb files",
         )
         cmd.add_argument("--target-similarity-processes", type=int, help="Worker process count for TM-score target similarity generation")
         cmd.add_argument("--target-similarity-chunksize", type=int, help="Multiprocessing chunksize for TM-score target similarity generation")
