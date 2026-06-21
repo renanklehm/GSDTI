@@ -296,6 +296,7 @@ def _restrict_to_existing_esmfold_targets(paths: DatasetPaths, config: Preparati
     old_targets = pd.read_csv(paths.targets_table)
     before_interactions = len(interactions)
     retained_target_ids = set()
+    existing_pdb_target_ids = set()
     excluded_rows = []
     exclusion_counts = {"missing": 0, "unreadable": 0, "mismatched": 0}
     for source_row, row in old_targets.iterrows():
@@ -306,6 +307,7 @@ def _restrict_to_existing_esmfold_targets(paths: DatasetPaths, config: Preparati
             reason = "Missing ESMFold PDB"
             exclusion_kind = "missing"
         else:
+            existing_pdb_target_ids.add(target_id)
             try:
                 pdb_sequence = _load_pdb_sequence(pdb_path)
             except Exception as exc:
@@ -351,6 +353,11 @@ def _restrict_to_existing_esmfold_targets(paths: DatasetPaths, config: Preparati
             f"--skip-esmfold found no matching calculated target PDBs from {paths.targets_table} in {paths.esmfold_dir}"
         )
 
+    existing_pdb_interactions = interactions[
+        interactions["Target_ID"].astype(str).isin(existing_pdb_target_ids)
+    ].reset_index(drop=True)
+    existing_pdb_targets = build_targets_table(existing_pdb_interactions)
+    existing_pdb_drugs = build_drugs_table(existing_pdb_interactions)
     interactions = interactions[interactions["Target_ID"].astype(str).isin(retained_target_ids)].reset_index(drop=True)
     new_targets = build_targets_table(interactions)
     new_drugs = build_drugs_table(interactions)
@@ -361,38 +368,68 @@ def _restrict_to_existing_esmfold_targets(paths: DatasetPaths, config: Preparati
         _log(f"Skipping ESMFold generation: all {len(new_targets)} canonical targets already have PDB files")
         return
 
-    old_target_positions = {str(target_id): index for index, target_id in enumerate(old_targets["Target_ID"])}
-    old_drug_positions = {str(drug_id): index for index, drug_id in enumerate(old_drugs["Drug_ID"])}
-    target_indices = [old_target_positions[str(target_id)] for target_id in new_targets["Target_ID"]]
-    drug_indices = [old_drug_positions[str(drug_id)] for drug_id in new_drugs["Drug_ID"]]
+    def resolve_compaction_indices(artifact_size, filtered_table, source_tables, id_column, artifact_name):
+        if artifact_size == len(filtered_table):
+            return None
+        for source_name, source_table in source_tables:
+            if artifact_size != len(source_table):
+                continue
+            source_positions = {
+                str(identifier): index
+                for index, identifier in enumerate(source_table[id_column])
+            }
+            filtered_identifiers = [str(identifier) for identifier in filtered_table[id_column]]
+            if not set(filtered_identifiers).issubset(source_positions):
+                continue
+            indices = [source_positions[identifier] for identifier in filtered_identifiers]
+            _log(f"Compacting {artifact_name} from the {source_name} table layout")
+            return indices
+        expected_sizes = sorted({len(table) for _, table in source_tables} | {len(filtered_table)})
+        raise ValueError(
+            f"{artifact_name} has {artifact_size} rows, expected one of {expected_sizes} for the known table layouts"
+        )
+
+    target_sources = [
+        ("original", old_targets),
+        ("existing-PDB", existing_pdb_targets),
+    ]
+    drug_sources = [
+        ("original", old_drugs),
+        ("existing-PDB", existing_pdb_drugs),
+    ]
 
     if not config.force and paths.protein_features.exists():
         with open(paths.protein_features, "rb") as handle:
             protein_features = pickle.load(handle)
-        if len(protein_features) == len(old_targets):
+        protein_indices = resolve_compaction_indices(
+            len(protein_features), new_targets, target_sources, "Target_ID", paths.protein_features.name
+        )
+        if protein_indices is not None:
             with open(paths.protein_features, "wb") as handle:
-                pickle.dump([protein_features[index] for index in target_indices], handle)
-        elif len(protein_features) != len(new_targets):
-            raise ValueError("prot_rep.pkl is aligned with neither the original nor filtered targets.csv")
+                pickle.dump([protein_features[index] for index in protein_indices], handle)
 
     if paths.drug_features.exists():
         drug_features = load_feature_array(paths.drug_features)
-        if len(drug_features) == len(old_drugs):
+        drug_indices = resolve_compaction_indices(
+            len(drug_features), new_drugs, drug_sources, "Drug_ID", paths.drug_features.name
+        )
+        if drug_indices is not None:
             np.savez(paths.drug_features, fps=drug_features[drug_indices])
-        elif len(drug_features) != len(new_drugs):
-            raise ValueError("kpgt_base.npz is aligned with neither the original nor filtered drugs.csv")
 
-    for matrix_path, old_size, new_size, indices in [
-        (paths.target_similarity, len(old_targets), len(new_targets), target_indices),
-        (paths.drug_similarity, len(old_drugs), len(new_drugs), drug_indices),
+    for matrix_path, filtered_table, source_tables, id_column in [
+        (paths.target_similarity, new_targets, target_sources, "Target_ID"),
+        (paths.drug_similarity, new_drugs, drug_sources, "Drug_ID"),
     ]:
         if config.force or not matrix_path.exists():
             continue
         matrix = load_feature_array(matrix_path)
-        if matrix.shape == (old_size, old_size):
-            np.savez(matrix_path, matrix[np.ix_(indices, indices)])
-        elif matrix.shape != (new_size, new_size):
-            raise ValueError(f"{matrix_path.name} is aligned with neither the original nor filtered canonical table")
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            raise ValueError(f"{matrix_path.name} must be a square matrix, got shape={matrix.shape}")
+        matrix_indices = resolve_compaction_indices(
+            matrix.shape[0], filtered_table, source_tables, id_column, matrix_path.name
+        )
+        if matrix_indices is not None:
+            np.savez(matrix_path, matrix[np.ix_(matrix_indices, matrix_indices)])
 
     write_table(interactions, paths.interaction_table)
     write_table(new_drugs, paths.drugs_table)
