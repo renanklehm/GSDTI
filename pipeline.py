@@ -770,6 +770,63 @@ def prepare_dataset(
     return paths
 
 
+def repair_interaction_labels(
+    dataset_name: str,
+    input_path: str,
+    smiles_column: str = "smiles",
+    sequence_column: str = "sequence",
+    activity_column: str = "activity",
+    threshold: float = 0.0,
+    artifacts_dir: str | None = None,
+) -> DatasetPaths:
+    """Repair only Y/Label in an already-prepared canonical interaction table."""
+    import pandas as pd
+
+    paths = get_dataset_paths(dataset_name, artifacts_dir=artifacts_dir)
+    _require_file(paths.interaction_table, "canonical interaction table")
+
+    source = Path(input_path).expanduser().resolve()
+    repaired_source = normalize_interaction_dataframe(
+        read_table(source),
+        smiles_column=smiles_column,
+        sequence_column=sequence_column,
+        activity_column=activity_column,
+        threshold=threshold,
+        dataset_prefix=dataset_name,
+    )[["Drug", "Target", "Y", "Label"]]
+    existing = pd.read_csv(paths.interaction_table)
+
+    key_columns = ["Drug", "Target"]
+    occurrence_column = "_pair_occurrence"
+    repaired_source[occurrence_column] = repaired_source.groupby(key_columns, sort=False).cumcount()
+    existing[occurrence_column] = existing.groupby(key_columns, sort=False).cumcount()
+    repaired_values = repaired_source[key_columns + [occurrence_column, "Y", "Label"]]
+    repaired = existing.drop(columns=["Y", "Label"]).merge(
+        repaired_values,
+        on=key_columns + [occurrence_column],
+        how="left",
+        validate="one_to_one",
+        sort=False,
+    )
+
+    missing = repaired["Y"].isna() | repaired["Label"].isna()
+    if missing.any():
+        sample = repaired.loc[missing, key_columns].head(3).to_dict("records")
+        raise ValueError(
+            f"Could not match {int(missing.sum())} existing interaction rows to the raw input; "
+            f"examples: {sample}"
+        )
+
+    output_columns = existing.columns.drop(occurrence_column)
+    repaired = repaired.drop(columns=[occurrence_column])[output_columns]
+    write_table(repaired, paths.interaction_table)
+    _log(
+        f"Repaired Y and Label for {len(repaired)} rows in {paths.interaction_table}; "
+        "all derived drug and target artifacts were left unchanged"
+    )
+    return paths
+
+
 def _load_training_assets(paths: DatasetPaths):
     import pandas as pd
 
@@ -1127,7 +1184,12 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--smiles-column", default="smiles")
         cmd.add_argument("--sequence-column", default="sequence")
         cmd.add_argument("--activity-column", default="activity")
-        cmd.add_argument("--threshold", type=float, default=0.0, help="Threshold to derive binary Label from numeric activity")
+        cmd.add_argument(
+            "--threshold",
+            type=float,
+            default=0.0,
+            help="Threshold to derive Label from non-binary activity; exact 0/1 activity is preserved as Label",
+        )
         cmd.add_argument("--artifacts-dir", help="Root directory for canonical datasets and derived artifacts")
         cmd.add_argument("--kpgt-dir", help="Path to an external KPGT checkout")
         cmd.add_argument("--kpgt-model-path", help="Path to the pretrained KPGT model file")
@@ -1176,6 +1238,24 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--random-state", type=int, default=42)
     run.add_argument("--early-stopping-patience", type=int, default=5, help="Stop after this many validation-F1 plateau epochs; 0 disables early stopping")
     run.add_argument("--output-name", help="Prediction filename prefix")
+
+    repair = subparsers.add_parser(
+        "repair-labels",
+        help="Repair Y/Label in an existing canonical interaction table without regenerating derived artifacts",
+        formatter_class=formatter,
+    )
+    repair.add_argument("--dataset", required=True)
+    repair.add_argument("--input", required=True, help="Original raw dataset in CSV or Parquet")
+    repair.add_argument("--smiles-column", default="smiles")
+    repair.add_argument("--sequence-column", default="sequence")
+    repair.add_argument("--activity-column", default="activity")
+    repair.add_argument(
+        "--threshold",
+        type=float,
+        default=0.0,
+        help="Threshold to derive Label from non-binary activity; exact 0/1 activity is preserved as Label",
+    )
+    repair.add_argument("--artifacts-dir", help="Root directory containing the already-prepared dataset")
     return parser
 
 
@@ -1211,6 +1291,18 @@ def main() -> None:
             sequence_column=args.sequence_column,
             activity_column=args.activity_column,
             config=_preparation_config_from_args(args),
+        )
+        return
+
+    if args.command == "repair-labels":
+        repair_interaction_labels(
+            dataset_name=args.dataset,
+            input_path=args.input,
+            smiles_column=args.smiles_column,
+            sequence_column=args.sequence_column,
+            activity_column=args.activity_column,
+            threshold=args.threshold,
+            artifacts_dir=args.artifacts_dir,
         )
         return
 

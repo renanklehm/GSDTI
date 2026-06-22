@@ -126,7 +126,13 @@ def normalize_interaction_dataframe(
 
     canonical.insert(0, "Drug_ID", canonical["Drug"].map(drug_ids))
     canonical.insert(2, "Target_ID", canonical["Target"].map(target_ids))
-    canonical["Label"] = (canonical["Y"] >= threshold).astype(int)
+    # A binary activity column is already a label. Applying the historical
+    # default threshold (Y >= 0) to it silently turned both 0 and 1 into 1.
+    unique_y = set(canonical["Y"].unique())
+    if unique_y.issubset({0.0, 1.0}):
+        canonical["Label"] = canonical["Y"].astype(int)
+    else:
+        canonical["Label"] = (canonical["Y"] >= threshold).astype(int)
     canonical["Target_Length"] = canonical["Target"].str.len()
     return canonical[["Drug_ID", "Drug", "Target_ID", "Target", "Y", "Label", "Target_Length"]]
 

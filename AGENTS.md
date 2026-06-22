@@ -23,8 +23,10 @@
 
 ## Data And Entry Points
 - The checked-in sample dataset is under `data/BindingDB/`, with `drugs/drugs.csv`, `targets/targets.csv`, and `df_less1000.csv`.
-- `main.py` supports `prepare`, `train`, and `run` subcommands. Use it for both the checked-in BindingDB sample and custom datasets.
+- `main.py` supports `prepare`, `train`, `run`, and `repair-labels` subcommands. Use it for both the checked-in BindingDB sample and custom datasets.
 - Custom datasets can be ingested from `.csv` or `.parquet` with user-specified `smiles`, `sequence`, and `activity` columns. The pipeline rewrites them into the repo's canonical `Drug_ID/Drug/Target_ID/Target/Y/Label/Target_Length` layout under `data/<dataset>/`.
+- Binary activity columns containing only `0` and `1` are treated as already-labeled data: canonical `Y` preserves the numeric activity and `Label` copies it exactly instead of applying the numeric threshold.
+- `main.py repair-labels` repairs only `Y` and `Label` in an already-prepared `df_less1000.csv` by matching the original CSV/Parquet rows to surviving canonical interactions. It leaves all expensive KPGT, ESM-2, ESMFold, graph, and similarity artifacts untouched.
 - The unified pipeline can also place canonical datasets and derived artifacts under a custom root passed via `--artifacts-dir` instead of the repo-local `data/` directory.
 - The unified pipeline creates the expected derived artifacts under `<artifacts-dir>/<dataset>/drugs` and `<artifacts-dir>/<dataset>/targets`: `kpgt_base.npz`, `prot_rep.pkl`, target graph `.pt` files, `drug_simmatrix.npz`, and `target_simmatrix.npz`.
 - If KPGT cannot build a graph for a substance, the streaming extractor records it in `<artifacts-dir>/<dataset>/excluded.csv`, omits it from `kpgt_base.npz`, and `pipeline.py` removes that `Drug_ID` from `drugs.csv` and every interaction row before subsequent preparation stages run.
