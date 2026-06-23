@@ -103,6 +103,7 @@ dependencies:
   - openssl=3.4.1=h7b32b05_0
   - pandas=2.2.3=py312h6a678d5_0
   - pillow=11.0.0=py312hcea889d_1
+  - pyarrow=18.1.0
   - pip=24.2=py312h06a4308_0
   - pysocks=1.7.1=py312h06a4308_0
   - python=3.12.2=hab00c5b_0_cpython

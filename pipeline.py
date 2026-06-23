@@ -828,15 +828,7 @@ def repair_interaction_labels(
 
 
 def _load_training_assets(paths: DatasetPaths):
-    import pandas as pd
-
-    _log(f"Loading drug features: {paths.drug_features}")
-    drug_features = load_feature_array(paths.drug_features)
-    _log(f"Loading drugs table: {paths.drugs_table}")
-    drug_df = pd.read_csv(paths.drugs_table)
-    _log(f"Loading targets table: {paths.targets_table}")
-    target_df = pd.read_csv(paths.targets_table)
-    drug_dict = dict(zip(drug_df["Drug_ID"], drug_features))
+    drug_features, drug_df, target_df, drug_dict = _load_model_assets(paths)
     _log(f"Loading drug similarity matrix: {paths.drug_similarity}")
     tanimoto_matrix = load_feature_array(paths.drug_similarity)
     _log(f"Loading target similarity matrix: {paths.target_similarity}")
@@ -851,12 +843,41 @@ def _load_training_assets(paths: DatasetPaths):
     return drug_features, drug_df, target_df, drug_dict, tanimoto_matrix, tm_score_matrix
 
 
-def _merge_predictions(raw_df, prediction_df):
+def _load_model_assets(paths: DatasetPaths):
     import pandas as pd
 
-    prediction_lookup = prediction_df[["Drug_ID", "Target_ID", "predicted_label"]].drop_duplicates()
-    merged = raw_df.merge(prediction_lookup, on=["Drug_ID", "Target_ID"], how="left")
-    return merged.rename(columns={"Label": "label_true", "predicted_label": "label_predicted", "Drug": "smiles", "Target": "sequence"})
+    _log(f"Loading drug features: {paths.drug_features}")
+    drug_features = load_feature_array(paths.drug_features)
+    _log(f"Loading drugs table: {paths.drugs_table}")
+    drug_df = pd.read_csv(paths.drugs_table)
+    _log(f"Loading targets table: {paths.targets_table}")
+    target_df = pd.read_csv(paths.targets_table)
+    if len(drug_df) != len(drug_features):
+        raise ValueError("drugs.csv and kpgt_base.npz have different lengths.")
+    drug_dict = dict(zip(drug_df["Drug_ID"], drug_features))
+    _log(
+        "Loaded model assets: "
+        f"{len(drug_df)} drugs, {len(target_df)} targets, "
+        f"drug_features_shape={getattr(drug_features, 'shape', 'unknown')}"
+    )
+    return drug_features, drug_df, target_df, drug_dict
+
+
+def _build_prediction_export(raw_df, predictions, probabilities):
+    import numpy as np
+
+    predictions = np.asarray(predictions)
+    probabilities = np.asarray(probabilities)
+    if len(raw_df) != len(predictions) or len(raw_df) != len(probabilities):
+        raise ValueError("Prediction output length does not match the scored interaction table.")
+    if probabilities.ndim != 2 or probabilities.shape[1] != 2:
+        raise ValueError(f"Expected two-class probabilities, got shape {probabilities.shape}.")
+
+    output = raw_df[["Drug", "Target", "Y"]].copy()
+    output.columns = ["smiles", "sequence", "real_value"]
+    output["label"] = predictions.astype(int)
+    output["probability"] = probabilities[:, 1]
+    return output[["smiles", "sequence", "label", "probability", "real_value"]]
 
 
 def run_training(
@@ -1144,25 +1165,16 @@ def run_training(
     )
     _log(f"Final test summary: accuracy={test_acc:.2f}%, f1={test_f1:.4f}")
 
-    _log("Merging validation and test predictions")
-    validation_predictions = validation_df[["Drug_ID", "Target_ID", "Drug", "Target", "Y"]].copy()
-    validation_predictions["predicted_label"] = best_predictions
-    test_predictions = test_df[["Drug_ID", "Target_ID", "Drug", "Target", "Y"]].copy()
-    test_predictions["predicted_label"] = test_preds
-
     output_root = Path(output_dir).expanduser().resolve() if output_dir else RESULTS_ROOT
     output_root.mkdir(parents=True, exist_ok=True)
-    output_path = output_root / f"{output_name or train_dataset_name}_predictions.csv"
+    output_path = output_root / f"{output_name or train_dataset_name}_predictions.parquet"
     _log(f"Writing predictions to {output_path}")
 
-    output_df = pd.concat(
-        [
-            _merge_predictions(validation_df, validation_predictions),
-            _merge_predictions(test_df, test_predictions),
-        ],
-        ignore_index=True,
-    )[["sequence", "smiles", "label_true", "label_predicted"]]
-    output_df.to_csv(output_path, index=False)
+    prediction_exports = [_build_prediction_export(validation_df, best_predictions, best_probs)]
+    if test_paths is not None:
+        prediction_exports.append(_build_prediction_export(test_df, test_preds, test_probs))
+    output_df = pd.concat(prediction_exports, ignore_index=True)
+    output_df.to_parquet(output_path, index=False)
 
     _log(f"Saved predictions to {output_path}")
     _log(f"Validation F1: {best_f1:.4f}")
@@ -1170,10 +1182,86 @@ def run_training(
     return output_path
 
 
+def run_inference(
+    dataset_name: str,
+    checkpoint_path: str,
+    batch_size: int = 64,
+    artifacts_dir: str | None = None,
+    output_dir: str | None = None,
+    output_name: str | None = None,
+) -> Path:
+    import pandas as pd
+    import torch
+    from torch.utils.data import DataLoader
+
+    from loss import FocalLoss
+    from model import GraphDTI_bi
+    from utils import GraphDataset_withsim, custom_collate_fn_test, evaluate_cl
+
+    if batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    resolved_checkpoint = Path(checkpoint_path).expanduser().resolve()
+    _require_file(resolved_checkpoint, "inference checkpoint")
+
+    paths = get_dataset_paths(dataset_name, artifacts_dir=artifacts_dir)
+    _log(f"Starting inference for prepared dataset '{dataset_name}'")
+    _log(f"Checkpoint: {resolved_checkpoint}")
+    _log(f"Artifacts root: {resolve_artifacts_root(artifacts_dir)}")
+    _log(f"Loading inference interactions: {paths.interaction_table}")
+    interactions = pd.read_csv(paths.interaction_table)
+    drug_features, drug_df, target_df, drug_dict = _load_model_assets(paths)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _log(f"Inference device: {device}")
+    if device.type == "cuda":
+        _log(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+
+    dataset = GraphDataset_withsim(
+        interactions,
+        drug_df,
+        target_df,
+        drug_dict,
+        str(paths.graph_dir),
+    )
+    loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=custom_collate_fn_test,
+    )
+    _log(f"Inference rows={len(dataset)}, batches={len(loader)}, batch_size={batch_size}")
+
+    model = GraphDTI_bi(drug_features[0].shape[0], 1280, 2, surface_feature=False).to(device)
+    checkpoint = _load_torch_checkpoint(torch, resolved_checkpoint, map_location=device)
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"Checkpoint does not contain model_state_dict: {resolved_checkpoint}")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    _log(f"Loaded model weights from epoch {checkpoint.get('epoch', 'unknown')}")
+
+    weights = torch.tensor([1.0, 1.0], device=device)
+    criterion = FocalLoss(alpha=1, gamma=2, weight=weights)
+    _, accuracy, _, _, f1, predictions, _, probabilities = evaluate_cl(
+        model,
+        loader,
+        criterion,
+        device,
+        desc="Inference",
+    )
+
+    output_root = Path(output_dir).expanduser().resolve() if output_dir else RESULTS_ROOT
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_path = output_root / f"{output_name or dataset_name}_predictions.parquet"
+    _log(f"Writing inference predictions to {output_path}")
+    _build_prediction_export(interactions, predictions, probabilities).to_parquet(output_path, index=False)
+    _log(f"Saved inference predictions to {output_path}")
+    _log(f"Inference F1: {f1:.4f}, accuracy: {accuracy:.2f}%")
+    return output_path
+
+
 def build_parser() -> argparse.ArgumentParser:
     formatter = lambda prog: argparse.HelpFormatter(prog, width=180)
     parser = argparse.ArgumentParser(
-        description="Unified GS-DTI data preparation and training entrypoint.",
+        description="Unified GS-DTI data preparation, training, and inference entrypoint.",
         formatter_class=formatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1215,7 +1303,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--dataset", required=True, help="Training dataset name")
     train.add_argument("--test-dataset", help="Optional external evaluation dataset name")
     train.add_argument("--artifacts-dir", help="Root directory for canonical datasets and derived artifacts")
-    train.add_argument("--output-dir", help="Directory where prediction CSVs are saved")
+    train.add_argument("--output-dir", help="Directory where prediction Parquet files are saved")
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--batch-size", type=int, default=64)
     train.add_argument("--learning-rate", type=float, default=5e-5)
@@ -1225,11 +1313,19 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--early-stopping-patience", type=int, default=5, help="Stop after this many validation-F1 plateau epochs; 0 disables early stopping")
     train.add_argument("--output-name", help="Prediction filename prefix")
 
+    infer = subparsers.add_parser("infer", help="Run a trained checkpoint on a prepared dataset", formatter_class=formatter)
+    infer.add_argument("--dataset", required=True, help="Prepared dataset name")
+    infer.add_argument("--checkpoint", required=True, help="Training checkpoint (.pt) containing model_state_dict")
+    infer.add_argument("--artifacts-dir", help="Root directory containing the prepared dataset")
+    infer.add_argument("--output-dir", help="Directory where the prediction Parquet file is saved")
+    infer.add_argument("--output-name", help="Prediction filename prefix")
+    infer.add_argument("--batch-size", type=int, default=64)
+
     run = subparsers.add_parser("run", help="Prepare then train in one command", formatter_class=formatter)
     add_shared_prepare_args(run)
     run.add_argument("--test-dataset", help="Optional external evaluation dataset name")
     run.add_argument("--test-input", help="Optional raw test dataset in CSV or Parquet")
-    run.add_argument("--output-dir", help="Directory where prediction CSVs are saved")
+    run.add_argument("--output-dir", help="Directory where prediction Parquet files are saved")
     run.add_argument("--epochs", type=int, default=1)
     run.add_argument("--batch-size", type=int, default=64)
     run.add_argument("--learning-rate", type=float, default=5e-5)
@@ -1320,6 +1416,17 @@ def main() -> None:
             args.dataset,
             test_dataset_name=args.test_dataset,
             training_config=config,
+            artifacts_dir=args.artifacts_dir,
+            output_dir=args.output_dir,
+            output_name=args.output_name,
+        )
+        return
+
+    if args.command == "infer":
+        run_inference(
+            dataset_name=args.dataset,
+            checkpoint_path=args.checkpoint,
+            batch_size=args.batch_size,
             artifacts_dir=args.artifacts_dir,
             output_dir=args.output_dir,
             output_name=args.output_name,
