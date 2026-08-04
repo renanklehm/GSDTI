@@ -416,9 +416,20 @@ def _restrict_to_existing_esmfold_targets(paths: DatasetPaths, config: Preparati
         if drug_indices is not None:
             np.savez(paths.drug_features, fps=drug_features[drug_indices])
 
+    # drug_similarity now stores one fingerprint row per drug (like
+    # drug_features), not a square drug x drug matrix, so it is compacted
+    # the same way as drug_features instead of going through the square
+    # matrix loop below (which only target_similarity uses now).
+    if paths.drug_similarity.exists():
+        drug_fps = load_feature_array(paths.drug_similarity)
+        drug_sim_indices = resolve_compaction_indices(
+            len(drug_fps), new_drugs, drug_sources, "Drug_ID", paths.drug_similarity.name
+        )
+        if drug_sim_indices is not None:
+            np.savez(paths.drug_similarity, fps=drug_fps[drug_sim_indices])
+
     for matrix_path, filtered_table, source_tables, id_column in [
         (paths.target_similarity, new_targets, target_sources, "Target_ID"),
-        (paths.drug_similarity, new_drugs, drug_sources, "Drug_ID"),
     ]:
         if config.force or not matrix_path.exists():
             continue
@@ -678,16 +689,16 @@ def _generate_graphs(paths: DatasetPaths, config: PreparationConfig) -> None:
 def _generate_similarity_matrices(paths: DatasetPaths, config: PreparationConfig) -> None:
     import pandas as pd
 
-    from sim_matrix import compute_and_save_tm_score_matrix_parallel_optimized, compute_and_save_tanimoto_matrix
+    from sim_matrix import compute_and_save_tm_score_matrix_parallel_optimized, compute_and_save_drug_fingerprints
 
     drugs_df = pd.read_csv(paths.drugs_table)
     targets_df = pd.read_csv(paths.targets_table)
 
     if config.force or not paths.drug_similarity.exists():
-        _log(f"Generating drug similarity matrix at {paths.drug_similarity}")
-        compute_and_save_tanimoto_matrix(drugs_df, paths.drug_similarity)
+        _log(f"Generating drug fingerprints at {paths.drug_similarity}")
+        compute_and_save_drug_fingerprints(drugs_df, paths.drug_similarity)
     else:
-        _log(f"Skipping drug similarity matrix: already exists at {paths.drug_similarity}")
+        _log(f"Skipping drug fingerprints: already exists at {paths.drug_similarity}")
 
     if config.force or not paths.target_similarity.exists():
         missing_pdbs = [target_id for target_id in targets_df["Target_ID"] if not (paths.esmfold_dir / f"{target_id}.pdb").exists()]
@@ -829,18 +840,18 @@ def repair_interaction_labels(
 
 def _load_training_assets(paths: DatasetPaths):
     drug_features, drug_df, target_df, drug_dict = _load_model_assets(paths)
-    _log(f"Loading drug similarity matrix: {paths.drug_similarity}")
-    tanimoto_matrix = load_feature_array(paths.drug_similarity)
+    _log(f"Loading drug fingerprints: {paths.drug_similarity}")
+    drug_fingerprints = load_feature_array(paths.drug_similarity)
     _log(f"Loading target similarity matrix: {paths.target_similarity}")
     tm_score_matrix = load_feature_array(paths.target_similarity)
     _log(
         "Loaded training assets: "
         f"{len(drug_df)} drugs, {len(target_df)} targets, "
         f"drug_features_shape={getattr(drug_features, 'shape', 'unknown')}, "
-        f"drug_similarity_shape={getattr(tanimoto_matrix, 'shape', 'unknown')}, "
+        f"drug_fingerprints_shape={getattr(drug_fingerprints, 'shape', 'unknown')}, "
         f"target_similarity_shape={getattr(tm_score_matrix, 'shape', 'unknown')}"
     )
-    return drug_features, drug_df, target_df, drug_dict, tanimoto_matrix, tm_score_matrix
+    return drug_features, drug_df, target_df, drug_dict, drug_fingerprints, tm_score_matrix
 
 
 def _load_model_assets(paths: DatasetPaths):
@@ -923,7 +934,7 @@ def run_training(
         params_path.write_text(json.dumps(run_parameters, indent=2, sort_keys=True), encoding="utf-8")
     _log(f"Training run directory: {run_dir}")
 
-    train_drug_feature, train_drug_df, train_target_df, train_drug_dict, tanimoto_matrix, tm_score_matrix = _load_training_assets(train_paths)
+    train_drug_feature, train_drug_df, train_target_df, train_drug_dict, drug_fingerprints, tm_score_matrix = _load_training_assets(train_paths)
     _log(f"Loading training interactions: {train_paths.interaction_table}")
     train_df = pd.read_csv(train_paths.interaction_table)
     _log(f"Loaded {len(train_df)} interactions")
@@ -988,7 +999,7 @@ def run_training(
         dataset=train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=lambda batch: custom_collate_fn(batch, tanimoto_matrix, tm_score_matrix),
+        collate_fn=lambda batch: custom_collate_fn(batch, drug_fingerprints, tm_score_matrix),
     )
     val_loader = DataLoader(
         dataset=valid_dataset,

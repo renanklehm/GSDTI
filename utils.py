@@ -176,16 +176,32 @@ class GraphDataset_withsim(Dataset):
 
     
     
-def custom_collate_fn(batch, tanimoto_matrix, tm_score_matrix):
+def custom_collate_fn(batch, drug_fingerprints, tm_score_matrix):
+    """
+    drug_fingerprints: array (num_drugs, nbits) com a "impressão digital"
+    (Morgan fingerprint) de cada fármaco -- não é mais a matriz densa
+    drug x drug. A similaridade de Tanimoto entre os fármacos do lote é
+    calculada aqui, na hora, só para os fármacos deste batch (ex.: 64),
+    o que evita ter que guardar/carregar uma matriz N x N gigante.
+    """
     drugs, prots, labels, drug_idx, target_idx = zip(*batch)  # 拆分 batch 中的数据
     prots_batch = Batch.from_data_list(prots)  # 将 prot 批量化为 PyG 的 Batch
     # 将索引转换为张量
     drug_indices = np.asarray(drug_idx, dtype=np.int64)
     target_indices = np.asarray(target_idx, dtype=np.int64)
-    tanimoto_similarities = torch.tensor(
-        tanimoto_matrix[np.ix_(drug_indices, drug_indices)],  # 提取子矩阵
-        dtype=torch.float32
+
+    batch_fps = torch.tensor(
+        np.asarray(drug_fingerprints[drug_indices], dtype=np.float32),
+        dtype=torch.float32,
     )
+    # Tanimoto = |A ∩ B| / |A ∪ B|, calculado vetorialmente para o lote:
+    # intersection[i, j] = bits em comum entre o fármaco i e o fármaco j
+    # union[i, j] = total de bits dos dois - a intersecção
+    intersection = batch_fps @ batch_fps.T
+    counts = batch_fps.sum(dim=1)
+    union = counts.unsqueeze(1) + counts.unsqueeze(0) - intersection
+    tanimoto_similarities = intersection / union.clamp(min=1e-8)
+
     tm_score_similarities = torch.tensor(
         tm_score_matrix[np.ix_(target_indices, target_indices)],  # 提取子矩阵
         dtype=torch.float32

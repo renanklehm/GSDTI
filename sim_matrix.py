@@ -14,6 +14,11 @@ def compute_and_save_tanimoto_matrix(drug_df, save_path):
     计算并保存 Drug 的 Tanimoto 相似度矩阵
     :param drug_df: 包含 'Drug_ID' 和 'Drug' (SMILES) 列的 DataFrame
     :param save_path: 保存相似度矩阵的路径
+
+    NOTE: kept for reference/small datasets, but this materializes a dense
+    num_drugs x num_drugs matrix and does not scale past a few tens of
+    thousands of drugs (memory is O(N^2)). Use
+    compute_and_save_drug_fingerprints for large datasets (e.g. ChEMBL).
     """
     smiles_column = 'SMILES' if 'SMILES' in drug_df.columns else 'smiles'
     drug_smiles = drug_df[smiles_column].tolist()  # 提取 SMILES
@@ -32,6 +37,32 @@ def compute_and_save_tanimoto_matrix(drug_df, save_path):
     # 保存矩阵并返回
     np.savez(save_path, tanimoto_matrix)
     print(f"Tanimoto similarity matrix saved to: {save_path}")
+
+
+def compute_and_save_drug_fingerprints(drug_df, save_path, radius=2, nbits=1024):
+    """
+    Computes and saves the Morgan fingerprint of every drug (one row per
+    drug, shape (num_drugs, nbits)) instead of a dense num_drugs x num_drugs
+    similarity matrix. The pairwise Tanimoto similarity is computed later,
+    on the fly, only for the small number of drugs in a given training
+    batch (see utils.custom_collate_fn) -- so this scales to datasets with
+    millions of drugs, where a dense matrix would not fit in memory.
+    """
+    from rdkit.Chem import rdFingerprintGenerator
+
+    smiles_column = 'SMILES' if 'SMILES' in drug_df.columns else 'smiles'
+    drug_smiles = drug_df[smiles_column].tolist()
+    drug_mols = [Chem.MolFromSmiles(smiles) for smiles in drug_smiles]
+
+    generator = rdFingerprintGenerator.GetMorganGenerator(radius=radius, fpSize=nbits)
+
+    fingerprints = np.zeros((len(drug_mols), nbits), dtype=np.uint8)
+    for i, mol in enumerate(drug_mols):
+        fp = generator.GetFingerprint(mol)
+        DataStructs.ConvertToNumpyArray(fp, fingerprints[i])
+
+    np.savez(save_path, fps=fingerprints)
+    print(f"Drug fingerprints saved to: {save_path}")
     
 
 
