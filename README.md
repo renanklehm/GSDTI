@@ -123,6 +123,39 @@ python train_yourdataset_intracl.py
 ```
 *Trains ,validate and test on your dataset*
 
+### 3. Large-scale virtual screening (`batch-predict`)
+
+Scores every substance x target pair of a screening batch. One command prepares
+whatever is new, then streams the cartesian product to Parquet:
+
+```bash
+python main.py batch-predict --dataset MyScreen --checkpoint data/training_runs/<run>/best.pt --substances-json substances.json --targets-json targets.json --kpgt-dir ../KPGT --kpgt-model-path ../KPGT/models/pretrained/base/base.pth --kpgt-python /path/to/kpgt/python --output-dir results/screen
+```
+
+- **Preparation is incremental.** Substances and targets already present in the
+  dataset keep their ids and their KPGT / ESM-2 / ESMFold / graph artifacts;
+  only new ones are processed and appended.
+- **Output is streamed and resumable.** Predictions land in
+  `part-NNNNN.parquet` chunks with `substance_id`, `target_id`,
+  `predicted_label`, and `probability_active`. `progress.json` tracks the next
+  unscored pair, so an interrupted run picks up where it stopped. Rerun the
+  exact same command to resume; add `--no-resume` to start over.
+- **Ids map back** through `meta/substance_map.parquet` and
+  `meta/target_map.parquet`; anything dropped during preparation is listed in
+  `meta/unscored_entities.json`.
+
+Reading the results back:
+
+```bash
+python -c "import glob, pyarrow.dataset as ds; print(ds.dataset(sorted(glob.glob('results/screen/part-*.parquet'))).to_table().to_pandas().head())"
+```
+
+Build the entity Parquet tables from JSON arrays with:
+
+```bash
+python scripts/prepare_batch_tables.py --substances-json substances.json --targets-json targets.json --output-dir data/inference
+```
+
 ## Dataset-Information
 - **BindingDB**: Large-scale drug-target interaction database
 - **DAVIS**: Benchmark dataset for binding affinity prediction
