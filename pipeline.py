@@ -1269,108 +1269,6 @@ def run_inference(
     return output_path
 
 
-def run_neo4j_inference(
-    dataset_name: str,
-    checkpoint_path: str,
-    smiles_json: str,
-    sequences_json: str,
-    neo4j_config: str,
-    model_name: str,
-    pair_batch_size: int = 1024,
-    write_batch_size: int = 1024,
-    artifacts_dir: str | None = None,
-    progress_file: str | None = None,
-    resume: bool = True,
-) -> None:
-    """Score a Cartesian product without ever materializing it on disk or in RAM."""
-    import gc
-    import hashlib
-    import itertools
-    import pandas as pd
-    import torch
-    from torch.utils.data import DataLoader
-
-    from model import GraphDTI_bi
-    from neo4j_sink import Neo4jPredictionWriter, load_progress, read_json_string_list, save_progress
-    from utils import GraphDataset_withsim, custom_collate_fn_test
-
-    if pair_batch_size < 1 or write_batch_size < 1:
-        raise ValueError("--pair-batch-size and --write-batch-size must be at least 1")
-    smiles = read_json_string_list(smiles_json, "SMILES")
-    sequences = read_json_string_list(sequences_json, "sequences")
-    paths = get_dataset_paths(dataset_name, artifacts_dir=artifacts_dir)
-    resolved_checkpoint = Path(checkpoint_path).expanduser().resolve()
-    _require_file(resolved_checkpoint, "inference checkpoint")
-    drug_features, drug_df, target_df, drug_dict = _load_model_assets(paths)
-    drug_ids = dict(zip(drug_df["smiles"], drug_df["Drug_ID"]))
-    target_ids = dict(zip(target_df["Target"], target_df["Target_ID"]))
-    missing_smiles = [value for value in smiles if value not in drug_ids]
-    missing_sequences = [value for value in sequences if value not in target_ids]
-    if missing_smiles or missing_sequences:
-        raise ValueError(
-            "The prepared GS-DTI dataset must contain every supplied entity. "
-            f"Missing substances={len(missing_smiles)}, targets={len(missing_sequences)}. "
-            "Run prepare for these unique entities before infer-neo4j."
-        )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GraphDTI_bi(drug_features[0].shape[0], 1280, 2, surface_feature=False).to(device)
-    checkpoint = _load_torch_checkpoint(torch, resolved_checkpoint, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    total_pairs = len(smiles) * len(sequences)
-    fingerprint = hashlib.sha256(json.dumps([smiles, sequences, model_name], separators=(",", ":")).encode()).hexdigest()
-    progress_path = Path(progress_file) if progress_file else paths.root / f"neo4j_{fingerprint[:12]}.progress.json"
-    progress = load_progress(progress_path, fingerprint, total_pairs, resume)
-    start_index = int(progress["next_pair_index"])
-    if not 0 <= start_index <= total_pairs:
-        raise ValueError(f"Invalid next_pair_index in progress file: {start_index}")
-    try:
-        from tqdm.auto import tqdm
-        bar = tqdm(total=total_pairs, initial=start_index, desc="GSDTI → Neo4j", unit="pair", dynamic_ncols=True)
-    except ModuleNotFoundError:
-        bar = None
-    _log(f"Streaming {total_pairs:,} GS-DTI pairs from {start_index:,}; progress file: {progress_path}")
-
-    start_drug, start_target = divmod(start_index, len(sequences))
-    pair_iter = ((smiles[drug_index], sequences[target_index]) for drug_index in range(start_drug, len(smiles)) for target_index in range(start_target if drug_index == start_drug else 0, len(sequences)))
-    uploaded = start_index
-    with Neo4jPredictionWriter(neo4j_config) as writer, torch.no_grad():
-        while batch_pairs := list(itertools.islice(pair_iter, pair_batch_size)):
-            interactions = pd.DataFrame(
-                {
-                    "Drug_ID": [drug_ids[drug] for drug, _ in batch_pairs],
-                    "Target_ID": [target_ids[target] for _, target in batch_pairs],
-                    "Label": 0,
-                }
-            )
-            dataset = GraphDataset_withsim(interactions, drug_df, target_df, drug_dict, str(paths.graph_dir))
-            loader = DataLoader(dataset, batch_size=pair_batch_size, shuffle=False, collate_fn=custom_collate_fn_test)
-            rows: list[dict] = []
-            for drugs, prots, labels in loader:
-                logits, _, _ = model(drugs.to(device, dtype=torch.float32), prots.to(device))
-                probabilities = torch.softmax(logits, dim=1)[:, 1].detach().cpu().tolist()
-                start = len(rows)
-                rows.extend(
-                    {"smiles": batch_pairs[start + index][0], "sequence": batch_pairs[start + index][1], "model": model_name, "probability": float(probability)}
-                    for index, probability in enumerate(probabilities)
-                )
-            for offset in range(0, len(rows), write_batch_size):
-                row_batch = rows[offset : offset + write_batch_size]
-                writer.write(row_batch)
-                uploaded += len(row_batch)
-                progress["next_pair_index"] = uploaded
-                save_progress(progress_path, progress)
-                if bar is not None:
-                    bar.update(len(row_batch))
-            del rows, interactions, dataset, loader, batch_pairs
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    if bar is not None:
-        bar.close()
-
-
 def build_parser() -> argparse.ArgumentParser:
     formatter = lambda prog: argparse.HelpFormatter(prog, width=180)
     parser = argparse.ArgumentParser(
@@ -1433,19 +1331,6 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--output-dir", help="Directory where the prediction Parquet file is saved")
     infer.add_argument("--output-name", help="Prediction filename prefix")
     infer.add_argument("--batch-size", type=int, default=64)
-
-    neo4j = subparsers.add_parser("infer-neo4j", help="Stream all supplied substance x target predictions to Neo4j", formatter_class=formatter)
-    neo4j.add_argument("--dataset", required=True, help="Prepared dataset containing the supplied unique entities")
-    neo4j.add_argument("--checkpoint", required=True, help="Training checkpoint (.pt) containing model_state_dict")
-    neo4j.add_argument("--smiles-json", required=True, help="JSON array of canonical SMILES")
-    neo4j.add_argument("--sequences-json", required=True, help="JSON array of target sequences")
-    neo4j.add_argument("--neo4j-config", required=True, help="JSON file with uri, username, password, and optional database")
-    neo4j.add_argument("--model-name", default="GSDTI", help="Value stored in ACTIVITY_PREDICTION.model")
-    neo4j.add_argument("--pair-batch-size", type=int, default=1024)
-    neo4j.add_argument("--write-batch-size", type=int, default=1024)
-    neo4j.add_argument("--progress-file", help="Resumable JSON progress checkpoint; defaults under the dataset artifacts")
-    neo4j.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Resume the matching progress file (default: true)")
-    neo4j.add_argument("--artifacts-dir", help="Root directory containing the prepared dataset")
 
     run = subparsers.add_parser("run", help="Prepare then train in one command", formatter_class=formatter)
     add_shared_prepare_args(run)
@@ -1556,22 +1441,6 @@ def main() -> None:
             artifacts_dir=args.artifacts_dir,
             output_dir=args.output_dir,
             output_name=args.output_name,
-        )
-        return
-
-    if args.command == "infer-neo4j":
-        run_neo4j_inference(
-            dataset_name=args.dataset,
-            checkpoint_path=args.checkpoint,
-            smiles_json=args.smiles_json,
-            sequences_json=args.sequences_json,
-            neo4j_config=args.neo4j_config,
-            model_name=args.model_name,
-            pair_batch_size=args.pair_batch_size,
-            write_batch_size=args.write_batch_size,
-            artifacts_dir=args.artifacts_dir,
-            progress_file=args.progress_file,
-            resume=args.resume,
         )
         return
 
