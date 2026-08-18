@@ -86,6 +86,23 @@ def build_graphs(smiles, path_length: int, n_jobs: int):
     return graphs
 
 
+def probe_feature_dim(model, collator, path_length: int, device) -> int:
+    """Determine the KPGT feature width when every input row was excluded.
+
+    A known-valid molecule is run through the model just to read off the
+    output width; nothing about it is written to the result.
+    """
+    graphs = build_graphs(["C"], path_length, 1)
+    fingerprints = build_fingerprints(["C"])
+    descriptors = build_descriptors(["C"], 1)
+    dataset = ChunkMoleculeDataset(["C"], graphs, fingerprints, descriptors)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, drop_last=False, collate_fn=collator)
+    _, graph, ecfp, md, _ = next(iter(loader))
+    with torch.no_grad():
+        fps = model.generate_fps(graph.to(device), ecfp.to(device), md.to(device))
+    return int(fps.shape[1])
+
+
 def write_exclusions(excluded_csv: Path, rows, invalid_indices, reason: str) -> None:
     if not invalid_indices:
         return
@@ -297,7 +314,7 @@ def main():
             )
             print(f"KPGT progress: {write_offset}/{total_rows} input drugs ({(write_offset / total_rows) * 100:.1f}%)", flush=True)
 
-    if feature_memmap is None:
+    if total_rows == 0:
         raise ValueError(f"No drugs found in {input_csv}")
     if write_offset != total_rows:
         raise RuntimeError(f"KPGT processed {write_offset} input rows but expected {total_rows}")
@@ -310,7 +327,15 @@ def main():
     if excluded_indices:
         valid_mask[list(excluded_indices)] = False
 
-    np.savez(output_npz, fps=np.asarray(feature_memmap)[valid_mask])
+    if feature_memmap is None:
+        # Every input drug was excluded (e.g. all failed graph construction),
+        # so there is no on-disk feature array to slice into an empty result.
+        feature_dim = probe_feature_dim(model, collator, args.path_length, device)
+        features = np.zeros((0, feature_dim), dtype=np.float32)
+    else:
+        features = np.asarray(feature_memmap)[valid_mask]
+
+    np.savez(output_npz, fps=features)
     feature_npy.unlink(missing_ok=True)
     checkpoint_path.unlink(missing_ok=True)
     print(f"The extracted features were saved at {output_npz}", flush=True)
